@@ -111,6 +111,7 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
                 None => println!("container not created"),
             }
         }
+        Commands::Version => println!("{}", crate::build_info::render()),
     }
 
     Ok(())
