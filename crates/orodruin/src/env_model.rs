@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
+    ffi::CStr,
     path::{Path, PathBuf},
 };
 
@@ -17,6 +18,7 @@ pub struct ResolvedEnvironment {
     pub workdir: String,
     pub env: BTreeMap<String, String>,
     pub mounts: Vec<ResolvedMount>,
+    pub user: ResolvedUser,
     pub shell: Vec<String>,
     pub startup_command: Vec<String>,
     pub default_command: Option<Vec<String>>,
@@ -35,6 +37,14 @@ pub struct ResolvedMount {
     pub source: PathBuf,
     pub target: String,
     pub readonly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedUser {
+    pub username: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
 }
 
 impl ResolvedEnvironment {
@@ -89,6 +99,7 @@ impl ResolvedEnvironment {
             .build
             .as_ref()
             .map(|build| resolve_build(project_root, &container_name, build));
+        let user = resolve_current_user();
 
         Self {
             project_name,
@@ -104,6 +115,7 @@ impl ResolvedEnvironment {
             workdir,
             env: env_map,
             mounts,
+            user,
             shell: config
                 .shell
                 .clone()
@@ -183,6 +195,55 @@ fn slugify(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
+fn resolve_current_user() -> ResolvedUser {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let username = current_username(uid).unwrap_or_else(|| uid.to_string());
+    let home = if uid == 0 {
+        "/root".to_string()
+    } else {
+        format!("/home/{username}")
+    };
+    ResolvedUser {
+        username,
+        uid,
+        gid,
+        home,
+    }
+}
+
+fn current_username(uid: u32) -> Option<String> {
+    let mut buffer = vec![0; 4096];
+    let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            passwd.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status == 0 && !result.is_null() {
+        let passwd = unsafe { passwd.assume_init() };
+        return Some(
+            unsafe { CStr::from_ptr(passwd.pw_name) }
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+
+    env::var("USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("LOGNAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +276,8 @@ mod tests {
 
         assert_eq!(first.container_name, second.container_name);
         assert!(first.container_name.starts_with("orodruin-my-app-"));
+        assert!(!first.user.username.is_empty());
+        assert_eq!(first.user.home, format!("/home/{}", first.user.username));
     }
 
     #[test]
@@ -242,6 +305,8 @@ mod tests {
         assert_eq!(resolved.project_mount, "/workspace/app");
         assert_eq!(resolved.workdir, "/workspace/app");
         assert_eq!(resolved.mounts[0].source, Path::new("/tmp/app"));
+        assert_eq!(resolved.user.uid, unsafe { libc::getuid() });
+        assert_eq!(resolved.user.gid, unsafe { libc::getgid() });
     }
 
     #[test]

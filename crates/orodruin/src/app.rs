@@ -4,7 +4,7 @@ use clap::Parser;
 use serde_json::to_string_pretty;
 
 use crate::{
-    backend::{AppleContainerBackend, ContainerBackend, ExecRequest},
+    backend::{AppleContainerBackend, BackendError, ContainerBackend, ExecRequest},
     cli::{Cli, Commands, EnvironmentName, RunCommand},
     config::{CONFIG_FILE_NAME, LoadedConfig, ProjectConfig, default_init_config},
     env_model::ResolvedEnvironment,
@@ -35,19 +35,21 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
             let loaded = load_config(cli.config.as_deref())?;
             let resolved = resolve_environment(&loaded, &environment)?;
             materialize_environment(backend, &resolved)?;
-            backend.exec(
+            ensure_container_user(backend, &resolved)?;
+            match backend.exec(
                 &resolved.container_name,
                 &ExecRequest {
                     workdir: Some(resolved.workdir.clone()),
-                    env: resolved
-                        .env
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
+                    env: exec_environment(&resolved),
                     command: resolved.shell.clone(),
                     interactive: true,
+                    user: Some(resolved.user.clone()),
                 },
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(BackendError::CommandFailed { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Commands::Run(run) => {
             let loaded = load_config(cli.config.as_deref())?;
@@ -57,17 +59,15 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
             let resolved = resolve_environment(&loaded, &environment)?;
             materialize_environment(backend, &resolved)?;
             let command = resolve_run_command(&resolved, run)?;
+            ensure_container_user(backend, &resolved)?;
             backend.exec(
                 &resolved.container_name,
                 &ExecRequest {
                     workdir: Some(resolved.workdir.clone()),
-                    env: resolved
-                        .env
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
+                    env: exec_environment(&resolved),
                     command,
                     interactive: false,
+                    user: Some(resolved.user.clone()),
                 },
             )?;
         }
@@ -205,6 +205,108 @@ fn materialize_environment(
     }
 }
 
+fn ensure_container_user(
+    backend: &dyn ContainerBackend,
+    resolved: &ResolvedEnvironment,
+) -> Result<(), OrodruinError> {
+    backend.exec(
+        &resolved.container_name,
+        &ExecRequest {
+            workdir: Some("/".into()),
+            env: vec![
+                ("ORODRUIN_HOST_USER".into(), resolved.user.username.clone()),
+                ("ORODRUIN_HOST_UID".into(), resolved.user.uid.to_string()),
+                ("ORODRUIN_HOST_GID".into(), resolved.user.gid.to_string()),
+                ("ORODRUIN_HOST_HOME".into(), resolved.user.home.clone()),
+            ],
+            command: vec![
+                "/bin/sh".into(),
+                "-lc".into(),
+                bootstrap_user_script().into(),
+            ],
+            interactive: false,
+            user: None,
+        },
+    )?;
+    Ok(())
+}
+
+fn exec_environment(resolved: &ResolvedEnvironment) -> Vec<(String, String)> {
+    let mut env = resolved
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    env.push(("HOME".into(), resolved.user.home.clone()));
+    env.push(("USER".into(), resolved.user.username.clone()));
+    env.push(("LOGNAME".into(), resolved.user.username.clone()));
+    env
+}
+
+fn bootstrap_user_script() -> &'static str {
+    r#"set -eu
+
+username="${ORODRUIN_HOST_USER}"
+uid="${ORODRUIN_HOST_UID}"
+gid="${ORODRUIN_HOST_GID}"
+home="${ORODRUIN_HOST_HOME}"
+
+lookup_group_by_gid() {
+    awk -F: -v gid="$1" '$3 == gid { print $1; exit }' /etc/group
+}
+
+lookup_user_by_name() {
+    awk -F: -v name="$1" '$1 == name { print $3 ":" $4; exit }' /etc/passwd
+}
+
+lookup_user_by_uid() {
+    awk -F: -v uid="$1" '$3 == uid { print $1; exit }' /etc/passwd
+}
+
+group_name="$(lookup_group_by_gid "$gid")"
+if [ -z "$group_name" ]; then
+    if command -v groupadd >/dev/null 2>&1; then
+        groupadd -g "$gid" "$username"
+        group_name="$username"
+    elif command -v addgroup >/dev/null 2>&1; then
+        addgroup -g "$gid" "$username"
+        group_name="$username"
+    else
+        echo "missing groupadd/addgroup for gid ${gid}" >&2
+        exit 1
+    fi
+fi
+
+existing_user="$(lookup_user_by_name "$username")"
+if [ -n "$existing_user" ]; then
+    existing_uid="${existing_user%%:*}"
+    existing_gid="${existing_user##*:}"
+    if [ "$existing_uid" != "$uid" ] || [ "$existing_gid" != "$gid" ]; then
+        echo "user ${username} exists with uid:gid ${existing_uid}:${existing_gid}, expected ${uid}:${gid}" >&2
+        exit 1
+    fi
+else
+    uid_owner="$(lookup_user_by_uid "$uid")"
+    if [ -n "$uid_owner" ] && [ "$uid_owner" != "$username" ]; then
+        echo "uid ${uid} already owned by ${uid_owner}, cannot map ${username}" >&2
+        exit 1
+    fi
+
+    if command -v useradd >/dev/null 2>&1; then
+        useradd -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"
+    elif command -v adduser >/dev/null 2>&1; then
+        adduser -D -h "$home" -u "$uid" -G "$group_name" "$username"
+    else
+        echo "missing useradd/adduser for ${username}" >&2
+        exit 1
+    fi
+fi
+
+mkdir -p "$home"
+chown "$uid:$gid" "$home"
+"#
+}
+
 fn container_exists(
     backend: &dyn ContainerBackend,
     container_name: &str,
@@ -251,8 +353,8 @@ mod tests {
         created: RefCell<Vec<String>>,
         started: RefCell<Vec<String>>,
         deleted: RefCell<Vec<String>>,
-        execs: RefCell<Vec<Vec<String>>>,
-        exec_result: RefCell<Option<Result<(), BackendError>>>,
+        execs: RefCell<Vec<ExecRequest>>,
+        exec_results: RefCell<VecDeque<Result<(), BackendError>>>,
         builds: RefCell<Vec<String>>,
     }
 
@@ -274,7 +376,9 @@ mod tests {
 
     impl<'a> CurrentDirGuard<'a> {
         fn enter(path: &Path) -> Self {
-            let lock = CURRENT_DIR_LOCK.lock().unwrap();
+            let lock = CURRENT_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let previous = std::env::current_dir().unwrap();
             std::env::set_current_dir(path).unwrap();
             Self {
@@ -327,8 +431,8 @@ mod tests {
         }
 
         fn exec(&self, _container_name: &str, request: &ExecRequest) -> Result<(), BackendError> {
-            self.execs.borrow_mut().push(request.command.clone());
-            self.exec_result.borrow_mut().take().unwrap_or(Ok(()))
+            self.execs.borrow_mut().push(request.clone());
+            self.exec_results.borrow_mut().pop_front().unwrap_or(Ok(()))
         }
 
         fn delete(&self, container_name: &str) -> Result<(), BackendError> {
@@ -410,7 +514,15 @@ mod tests {
 
         run_with_backend(cli, &backend).unwrap();
         assert_eq!(backend.started.borrow().len(), 1);
-        assert_eq!(backend.execs.borrow()[0], vec![String::from("/bin/bash")]);
+        assert_eq!(backend.execs.borrow().len(), 2);
+        assert_eq!(
+            backend.execs.borrow()[1].command,
+            vec![String::from("/bin/bash")]
+        );
+        assert_eq!(
+            backend.execs.borrow()[1].user.as_ref().map(|user| user.uid),
+            Some(unsafe { libc::getuid() })
+        );
     }
 
     #[test]
@@ -420,12 +532,15 @@ mod tests {
         let _guard = CurrentDirGuard::enter(tempdir.path());
 
         let backend = MockBackend::with_lists(vec![vec![]]);
-        *backend.exec_result.borrow_mut() = Some(Err(BackendError::CommandFailed {
-            step: "exec command".into(),
-            command: "container exec demo /bin/bash".into(),
-            status: Some(127),
-            stderr: String::new(),
-        }));
+        *backend.exec_results.borrow_mut() = VecDeque::from([
+            Ok(()),
+            Err(BackendError::CommandFailed {
+                step: "exec command".into(),
+                command: "container exec demo /bin/bash".into(),
+                status: Some(127),
+                stderr: String::new(),
+            }),
+        ]);
 
         let cli = Cli {
             debug: false,
@@ -433,9 +548,11 @@ mod tests {
             command: Commands::Enter(EnvironmentName { env: "dev".into() }),
         };
 
-        let error = run_with_backend(cli, &backend).unwrap_err();
-        assert_eq!(error.exit_code(), 127);
-        assert_eq!(backend.execs.borrow()[0], vec![String::from("/bin/bash")]);
+        run_with_backend(cli, &backend).unwrap();
+        assert_eq!(
+            backend.execs.borrow()[1].command,
+            vec![String::from("/bin/bash")]
+        );
     }
 
     #[test]
@@ -481,7 +598,7 @@ mod tests {
 
         run_with_backend(cli, &backend).unwrap();
         assert_eq!(
-            backend.execs.borrow()[0],
+            backend.execs.borrow()[1].command,
             vec![String::from("cargo"), String::from("test")]
         );
         assert_eq!(backend.builds.borrow()[0], "demo-ci:dev");
@@ -578,5 +695,33 @@ mod tests {
 
         let resolved = ResolvedEnvironment::resolve(Path::new("/tmp/demo"), &project, "dev", &env);
         assert!(resolved.container_name.starts_with("orodruin-demo-"));
+    }
+
+    #[test]
+    fn enter_bootstraps_user_before_shell_exec() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Enter(EnvironmentName { env: "dev".into() }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+
+        let execs = backend.execs.borrow();
+        assert_eq!(execs[0].command[0], "/bin/sh");
+        assert!(execs[0].command[2].contains("useradd"));
+        assert_eq!(execs[0].user, None);
+        assert_eq!(
+            execs[1].env.iter().find(|(key, _)| key == "HOME"),
+            Some(&(
+                String::from("HOME"),
+                format!("/home/{}", execs[1].user.as_ref().unwrap().username)
+            ))
+        );
     }
 }

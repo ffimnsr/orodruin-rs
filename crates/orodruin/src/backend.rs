@@ -7,7 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    env_model::{ResolvedBuild, ResolvedEnvironment, ResolvedMount},
+    env_model::{ResolvedBuild, ResolvedEnvironment, ResolvedMount, ResolvedUser},
     state::{ContainerSummary, StateError, parse_inspect_output, parse_list_output},
 };
 
@@ -33,6 +33,7 @@ pub struct ExecRequest {
     pub env: Vec<(String, String)>,
     pub command: Vec<String>,
     pub interactive: bool,
+    pub user: Option<ResolvedUser>,
 }
 
 pub trait ContainerBackend {
@@ -118,6 +119,7 @@ impl AppleContainerBackend {
             args.push("-i".into());
             args.push("-t".into());
         }
+        append_user_args(&mut args, request.user.as_ref());
         if let Some(workdir) = &request.workdir {
             args.push("--workdir".into());
             args.push(workdir.clone());
@@ -294,6 +296,13 @@ fn append_mount_args(args: &mut Vec<String>, mounts: &[ResolvedMount]) {
     }
 }
 
+fn append_user_args(args: &mut Vec<String>, user: Option<&ResolvedUser>) {
+    if let Some(user) = user {
+        args.push("--user".into());
+        args.push(format!("{}:{}", user.uid, user.gid));
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     if value
         .chars()
@@ -332,6 +341,12 @@ mod tests {
                     readonly: true,
                 },
             ],
+            user: ResolvedUser {
+                username: "dev".into(),
+                uid: 501,
+                gid: 20,
+                home: "/home/dev".into(),
+            },
             shell: vec!["/bin/bash".into()],
             startup_command: vec!["sleep".into(), "infinity".into()],
             default_command: None,
@@ -368,10 +383,18 @@ mod tests {
                 env: vec![(String::from("FOO"), String::from("bar"))],
                 command: vec!["cargo".into(), "test".into()],
                 interactive: false,
+                user: Some(ResolvedUser {
+                    username: "dev".into(),
+                    uid: 501,
+                    gid: 20,
+                    home: "/home/dev".into(),
+                }),
             },
         );
 
         assert_eq!(spec.args[0], "exec");
+        assert!(spec.args.contains(&"--user".to_string()));
+        assert!(spec.args.contains(&"501:20".to_string()));
         assert!(spec.args.contains(&"--workdir".to_string()));
         assert!(spec.args.contains(&"orodruin-app-123".to_string()));
         assert_eq!(spec.args.last().map(String::as_str), Some("test"));
