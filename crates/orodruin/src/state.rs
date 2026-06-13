@@ -1,4 +1,5 @@
 use serde_json::Value;
+use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSummary {
@@ -14,13 +15,19 @@ impl ContainerSummary {
     }
 }
 
-pub fn parse_list_output(output: &str) -> Vec<ContainerSummary> {
-    let value = serde_json::from_str::<Value>(output).unwrap_or(Value::Null);
-    match value {
+#[derive(Debug, Error)]
+pub enum StateError {
+    #[error("failed to parse container list output: {0}")]
+    ParseList(#[source] serde_json::Error),
+}
+
+pub fn parse_list_output(output: &str) -> Result<Vec<ContainerSummary>, StateError> {
+    let value = serde_json::from_str::<Value>(output).map_err(StateError::ParseList)?;
+    Ok(match value {
         Value::Array(items) => items.into_iter().filter_map(parse_summary).collect(),
         Value::Object(_) => parse_summary(value).into_iter().collect(),
         _ => Vec::new(),
-    }
+    })
 }
 
 pub fn parse_inspect_output(output: &str) -> Option<Value> {
@@ -60,4 +67,19 @@ fn field(value: &Value, names: &[&str]) -> Option<String> {
             _ => None,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_parse_error_bubbles_up() {
+        let error = parse_list_output("not-json").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse container list output")
+        );
+    }
 }

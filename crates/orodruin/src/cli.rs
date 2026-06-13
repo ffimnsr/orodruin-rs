@@ -48,6 +48,9 @@ pub struct EnvironmentName {
 pub struct RunCommand {
     #[arg(help = "Environment name from orodruin.toml")]
     pub env: String,
-    #[arg(last = true, help = "Command to execute after `--`; uses the environment default if omitted")]
+    #[arg(
+        last = true,
+        help = "Command to execute after `--`; uses the environment default if omitted"
+    )]
     pub command: Vec<String>,
 }

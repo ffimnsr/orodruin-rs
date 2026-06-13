@@ -133,12 +133,12 @@ impl ProjectConfig {
             if let Some(workdir) = &env.workdir {
                 validate_absolute_path(name, "workdir", workdir)?;
             }
-            if let Some(build) = &env.build {
-                if build.context.trim().is_empty() {
-                    return Err(ConfigError::Validation(format!(
-                        "environment `{name}` has an empty build context"
-                    )));
-                }
+            if let Some(build) = &env.build
+                && build.context.trim().is_empty()
+            {
+                return Err(ConfigError::Validation(format!(
+                    "environment `{name}` has an empty build context"
+                )));
             }
 
             let mut preserve_env = HashSet::new();
@@ -158,26 +158,26 @@ impl ProjectConfig {
                 }
                 validate_absolute_path(name, "mount target", &mount.target)?;
             }
-            if let Some(shell) = &env.shell {
-                if shell.is_empty() {
-                    return Err(ConfigError::Validation(format!(
-                        "environment `{name}` shell must contain at least one token"
-                    )));
-                }
+            if let Some(shell) = &env.shell
+                && shell.is_empty()
+            {
+                return Err(ConfigError::Validation(format!(
+                    "environment `{name}` shell must contain at least one token"
+                )));
             }
-            if let Some(startup_command) = &env.startup_command {
-                if startup_command.is_empty() {
-                    return Err(ConfigError::Validation(format!(
-                        "environment `{name}` startup_command must contain at least one token"
-                    )));
-                }
+            if let Some(startup_command) = &env.startup_command
+                && startup_command.is_empty()
+            {
+                return Err(ConfigError::Validation(format!(
+                    "environment `{name}` startup_command must contain at least one token"
+                )));
             }
-            if let Some(default_command) = &env.default_command {
-                if default_command.is_empty() {
-                    return Err(ConfigError::Validation(format!(
-                        "environment `{name}` default_command must contain at least one token"
-                    )));
-                }
+            if let Some(default_command) = &env.default_command
+                && default_command.is_empty()
+            {
+                return Err(ConfigError::Validation(format!(
+                    "environment `{name}` default_command must contain at least one token"
+                )));
             }
         }
 

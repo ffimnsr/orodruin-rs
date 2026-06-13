@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
     env_model::{ResolvedBuild, ResolvedEnvironment, ResolvedMount},
-    state::{ContainerSummary, parse_inspect_output, parse_list_output},
+    state::{ContainerSummary, StateError, parse_inspect_output, parse_list_output},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +95,7 @@ impl AppleContainerBackend {
             "--workdir".into(),
             environment.workdir.clone(),
         ];
-        append_env_args(
-            &mut args,
-            environment.env.iter().map(|(key, value)| (key, value)),
-        );
+        append_env_args(&mut args, environment.env.iter());
         append_mount_args(&mut args, &environment.mounts);
         args.push(environment.image.clone());
         args.extend(environment.startup_command.iter().cloned());
@@ -199,7 +196,7 @@ impl AppleContainerBackend {
 impl ContainerBackend for AppleContainerBackend {
     fn list_all(&self) -> Result<Vec<ContainerSummary>, BackendError> {
         let output = self.run_captured("list containers", &Self::build_list_spec())?;
-        Ok(parse_list_output(&output))
+        parse_list_output(&output).map_err(BackendError::from)
     }
 
     fn inspect_raw(&self, container_name: &str) -> Result<Option<Value>, BackendError> {
@@ -255,6 +252,8 @@ pub enum BackendError {
         status: Option<i32>,
         stderr: String,
     },
+    #[error(transparent)]
+    State(#[from] StateError),
 }
 
 impl BackendError {
@@ -353,7 +352,11 @@ mod tests {
             spec.args
                 .contains(&"type=bind,source=/tmp/cache,target=/cache,readonly".to_string())
         );
-        assert!(spec.args.ends_with(&[String::from("ubuntu:latest"), String::from("sleep"), String::from("infinity")]));
+        assert!(spec.args.ends_with(&[
+            String::from("ubuntu:latest"),
+            String::from("sleep"),
+            String::from("infinity")
+        ]));
     }
 
     #[test]

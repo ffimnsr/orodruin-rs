@@ -102,6 +102,10 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
             println!("container: {}", resolved.container_name);
             println!("image: {}", resolved.image);
             println!("workdir: {}", resolved.workdir);
+            if !container_exists(backend, &resolved.container_name)? {
+                println!("container not created");
+                return Ok(());
+            }
             let inspect = backend.inspect_raw(&resolved.container_name)?;
             match inspect {
                 Some(value) => println!(
@@ -180,10 +184,6 @@ fn materialize_environment(
     backend: &dyn ContainerBackend,
     resolved: &ResolvedEnvironment,
 ) -> Result<(), OrodruinError> {
-    if let Some(build) = &resolved.build {
-        backend.build_image(build)?;
-    }
-
     let current = backend
         .list_all()?
         .into_iter()
@@ -196,6 +196,9 @@ fn materialize_environment(
             Ok(())
         }
         None => {
+            if let Some(build) = &resolved.build {
+                backend.build_image(build)?;
+            }
             backend.create(resolved)?;
             Ok(())
         }
@@ -244,10 +247,12 @@ mod tests {
     struct MockBackend {
         list_results: RefCell<VecDeque<Vec<ContainerSummary>>>,
         inspect_value: RefCell<Option<serde_json::Value>>,
+        inspect_calls: RefCell<Vec<String>>,
         created: RefCell<Vec<String>>,
         started: RefCell<Vec<String>>,
         deleted: RefCell<Vec<String>>,
         execs: RefCell<Vec<Vec<String>>>,
+        exec_result: RefCell<Option<Result<(), BackendError>>>,
         builds: RefCell<Vec<String>>,
     }
 
@@ -296,8 +301,11 @@ mod tests {
 
         fn inspect_raw(
             &self,
-            _container_name: &str,
+            container_name: &str,
         ) -> Result<Option<serde_json::Value>, BackendError> {
+            self.inspect_calls
+                .borrow_mut()
+                .push(container_name.to_string());
             Ok(self.inspect_value.borrow().clone())
         }
 
@@ -320,7 +328,7 @@ mod tests {
 
         fn exec(&self, _container_name: &str, request: &ExecRequest) -> Result<(), BackendError> {
             self.execs.borrow_mut().push(request.command.clone());
-            Ok(())
+            self.exec_result.borrow_mut().take().unwrap_or(Ok(()))
         }
 
         fn delete(&self, container_name: &str) -> Result<(), BackendError> {
@@ -406,6 +414,31 @@ mod tests {
     }
 
     #[test]
+    fn enter_ignores_interactive_shell_exit_status() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+        *backend.exec_result.borrow_mut() = Some(Err(BackendError::CommandFailed {
+            step: "exec command".into(),
+            command: "container exec demo /bin/bash".into(),
+            status: Some(127),
+            stderr: String::new(),
+        }));
+
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Enter(EnvironmentName { env: "dev".into() }),
+        };
+
+        let error = run_with_backend(cli, &backend).unwrap_err();
+        assert_eq!(error.exit_code(), 127);
+        assert_eq!(backend.execs.borrow()[0], vec![String::from("/bin/bash")]);
+    }
+
+    #[test]
     fn rm_targets_resolved_container() {
         let tempdir = tempfile::tempdir().unwrap();
         write_config(tempdir.path());
@@ -460,7 +493,13 @@ mod tests {
         write_config(tempdir.path());
         let _guard = CurrentDirGuard::enter(tempdir.path());
 
-        let backend = MockBackend::with_lists(vec![]);
+        let container_name = resolved_name(tempdir.path(), "dev");
+        let backend = MockBackend::with_lists(vec![vec![ContainerSummary {
+            id: container_name.clone(),
+            name: Some(container_name.clone()),
+            status: Some("running".into()),
+            running: true,
+        }]]);
         *backend.inspect_value.borrow_mut() = Some(json!({ "name": "demo" }));
 
         let loaded = load_config(None).unwrap();
@@ -470,7 +509,49 @@ mod tests {
             .inspect_raw(&resolved.container_name)
             .unwrap()
             .unwrap();
+        assert_eq!(backend.inspect_calls.borrow().as_slice(), &[container_name]);
         assert_eq!(payload["name"], "demo");
+    }
+
+    #[test]
+    fn inspect_skips_backend_lookup_for_missing_container() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Inspect(EnvironmentName { env: "dev".into() }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+        assert!(backend.inspect_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn existing_built_container_does_not_rebuild_image() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+        let container_name = resolved_name(tempdir.path(), "ci");
+
+        let backend = MockBackend::with_lists(vec![vec![ContainerSummary {
+            id: container_name.clone(),
+            name: Some(container_name),
+            status: Some("running".into()),
+            running: true,
+        }]]);
+
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Create(EnvironmentName { env: "ci".into() }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+        assert!(backend.builds.borrow().is_empty());
     }
 
     #[test]
