@@ -196,7 +196,6 @@ fn materialize_environment(
         }
         None => {
             backend.create(resolved)?;
-            backend.start(&resolved.container_name)?;
             Ok(())
         }
     }
@@ -339,6 +338,7 @@ mod tests {
                 [envs.dev]
                 image = "ubuntu:latest"
                 shell = ["/bin/bash"]
+                startup_command = ["sleep", "infinity"]
 
                 [envs.ci]
                 build = { context = ".", file = "Containerfile", tag = "demo-ci:dev" }
@@ -490,6 +490,7 @@ mod tests {
             preserve_env: vec![],
             mounts: vec![],
             shell: None,
+            startup_command: None,
             default_command: None,
         };
 

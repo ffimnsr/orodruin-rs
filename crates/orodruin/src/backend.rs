@@ -88,7 +88,8 @@ impl AppleContainerBackend {
 
     pub fn build_create_spec(environment: &ResolvedEnvironment) -> CommandSpec {
         let mut args = vec![
-            "create".into(),
+            "run".into(),
+            "-d".into(),
             "--name".into(),
             environment.container_name.clone(),
             "--workdir".into(),
@@ -100,6 +101,7 @@ impl AppleContainerBackend {
         );
         append_mount_args(&mut args, &environment.mounts);
         args.push(environment.image.clone());
+        args.extend(environment.startup_command.iter().cloned());
         CommandSpec {
             program: "container".into(),
             args,
@@ -213,7 +215,10 @@ impl ContainerBackend for AppleContainerBackend {
     }
 
     fn create(&self, environment: &ResolvedEnvironment) -> Result<(), BackendError> {
-        self.run_interactive("create container", &Self::build_create_spec(environment))
+        self.run_interactive(
+            "create and start container",
+            &Self::build_create_spec(environment),
+        )
     }
 
     fn start(&self, container_name: &str) -> Result<(), BackendError> {
@@ -329,6 +334,7 @@ mod tests {
                 },
             ],
             shell: vec!["/bin/bash".into()],
+            startup_command: vec!["sleep".into(), "infinity".into()],
             default_command: None,
             build: None,
         }
@@ -340,12 +346,14 @@ mod tests {
         let spec = AppleContainerBackend::build_create_spec(&environment);
 
         assert_eq!(spec.program, "container");
-        assert_eq!(spec.args[0], "create");
+        assert_eq!(spec.args[0], "run");
+        assert_eq!(spec.args[1], "-d");
         assert!(spec.args.contains(&"--name".to_string()));
         assert!(
             spec.args
                 .contains(&"type=bind,source=/tmp/cache,target=/cache,readonly".to_string())
         );
+        assert!(spec.args.ends_with(&[String::from("ubuntu:latest"), String::from("sleep"), String::from("infinity")]));
     }
 
     #[test]

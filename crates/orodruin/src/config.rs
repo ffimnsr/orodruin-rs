@@ -35,6 +35,7 @@ pub struct EnvironmentConfig {
     #[serde(default)]
     pub mounts: Vec<MountConfig>,
     pub shell: Option<Vec<String>>,
+    pub startup_command: Option<Vec<String>>,
     pub default_command: Option<Vec<String>>,
 }
 
@@ -164,6 +165,13 @@ impl ProjectConfig {
                     )));
                 }
             }
+            if let Some(startup_command) = &env.startup_command {
+                if startup_command.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "environment `{name}` startup_command must contain at least one token"
+                    )));
+                }
+            }
             if let Some(default_command) = &env.default_command {
                 if default_command.is_empty() {
                     return Err(ConfigError::Validation(format!(
@@ -188,6 +196,7 @@ project_mount = "/workspace/{project_name}"
 workdir = "/workspace/{project_name}"
 preserve_env = ["SSH_AUTH_SOCK"]
 shell = ["/bin/bash"]
+startup_command = ["sleep", "infinity"]
 "#
     )
 }

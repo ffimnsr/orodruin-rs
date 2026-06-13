@@ -18,6 +18,7 @@ pub struct ResolvedEnvironment {
     pub env: BTreeMap<String, String>,
     pub mounts: Vec<ResolvedMount>,
     pub shell: Vec<String>,
+    pub startup_command: Vec<String>,
     pub default_command: Option<Vec<String>>,
     pub build: Option<ResolvedBuild>,
 }
@@ -107,6 +108,10 @@ impl ResolvedEnvironment {
                 .shell
                 .clone()
                 .unwrap_or_else(|| vec!["/bin/sh".to_string()]),
+            startup_command: config
+                .startup_command
+                .clone()
+                .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]),
             default_command: config.default_command.clone(),
             build,
         }
@@ -201,6 +206,7 @@ mod tests {
             preserve_env: vec![],
             mounts: vec![],
             shell: None,
+            startup_command: None,
             default_command: None,
         };
 
@@ -227,6 +233,7 @@ mod tests {
             preserve_env: vec![],
             mounts: vec![],
             shell: None,
+            startup_command: None,
             default_command: None,
         };
 
@@ -253,6 +260,7 @@ mod tests {
             preserve_env: vec!["SHOULD_NOT_EXIST".into()],
             mounts: vec![],
             shell: None,
+            startup_command: None,
             default_command: Some(vec!["cargo".into(), "test".into()]),
         };
 
@@ -265,6 +273,10 @@ mod tests {
         assert_eq!(
             resolved.default_command,
             Some(vec![String::from("cargo"), String::from("test")])
+        );
+        assert_eq!(
+            resolved.startup_command,
+            vec![String::from("sleep"), String::from("infinity")]
         );
     }
 }
