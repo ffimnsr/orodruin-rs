@@ -1,16 +1,34 @@
-use std::{ffi::OsString, fs, path::Path};
+use std::{
+    ffi::OsString,
+    fs,
+    net::IpAddr,
+    path::Path,
+    process::{Command as ProcessCommand, Stdio},
+};
 
-use clap::Parser;
-use serde_json::to_string_pretty;
+use clap::{CommandFactory, Parser};
+use clap_complete::generate;
+use serde_json::{Value, to_string_pretty};
 
 use crate::{
-    backend::{AppleContainerBackend, BackendError, ContainerBackend, ExecRequest},
-    cli::{Cli, Commands, EnvironmentName, RunCommand},
+    backend::{AppleContainerBackend, BackendError, CommandSpec, ContainerBackend, ExecRequest},
+    cli::{
+        BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, EnvironmentName,
+        ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
+        RequiredPassthroughArgs, ResourceCommands, RunCommand,
+        SystemCommands,
+    },
     config::{CONFIG_FILE_NAME, LoadedConfig, ProjectConfig, default_init_config},
     env_model::ResolvedEnvironment,
     error::OrodruinError,
     state::ContainerSummary,
 };
+
+struct PassthroughInvocation {
+    step: String,
+    prefix: Vec<String>,
+    args: Vec<String>,
+}
 
 pub fn run<I, T>(args: I) -> Result<(), OrodruinError>
 where
@@ -33,7 +51,7 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
         }
         Commands::Enter(environment) => {
             let loaded = load_config(cli.config.as_deref())?;
-            let resolved = resolve_environment(&loaded, &environment)?;
+            let resolved = resolve_optional_environment(&loaded, environment.env.as_deref(), "enter")?;
             materialize_environment(backend, &resolved)?;
             ensure_container_user(backend, &resolved)?;
             match backend.exec(
@@ -49,6 +67,19 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
                 Ok(()) => {}
                 Err(BackendError::CommandFailed { .. }) => {}
                 Err(error) => return Err(error.into()),
+            }
+        }
+        Commands::Ssh(command) => {
+            let loaded = load_config(cli.config.as_deref())?;
+            let resolved = resolve_optional_environment(&loaded, command.env.as_deref(), "ssh")?;
+            materialize_environment(backend, &resolved)?;
+            ensure_container_user(backend, &resolved)?;
+            let target = resolve_ssh_target(backend, &resolved)?;
+            let spec = build_ssh_spec(&resolved, &target);
+            if command.print {
+                println!("{}", spec.render());
+            } else {
+                run_host_command(&spec)?;
             }
         }
         Commands::Run(run) => {
@@ -115,10 +146,173 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
                 None => println!("container not created"),
             }
         }
+        Commands::Pull(args) => run_passthrough(backend, passthrough("pull image", &["image", "pull"], args))?,
+        Commands::Images(args) => run_passthrough(backend, passthrough("list images", &["image", "list"], args))?,
+        Commands::Rmi(args) => run_passthrough(backend, passthrough("remove image", &["image", "delete"], args))?,
+        Commands::Ps(args) => run_passthrough(backend, passthrough("list containers", &["list"], args))?,
+        Commands::Logs(args) => run_passthrough(backend, passthrough("show container logs", &["logs"], args))?,
+        Commands::Build(args) => run_passthrough(backend, passthrough("build image", &["build"], args))?,
+        Commands::Copy(args) => run_passthrough(backend, passthrough("copy files", &["copy"], args))?,
+        Commands::Login(args) => run_passthrough(backend, passthrough("login registry", &["registry", "login"], args))?,
+        Commands::Logout(args) => run_passthrough(backend, passthrough("logout registry", &["registry", "logout"], args))?,
+        Commands::Image(command) => run_passthrough(backend, image_passthrough(command))?,
+        Commands::Container(command) => run_passthrough(backend, container_passthrough(command))?,
+        Commands::Registry(command) => run_passthrough(backend, registry_passthrough(command))?,
+        Commands::Volume(command) => run_passthrough(backend, resource_passthrough("volume", command))?,
+        Commands::Network(command) => run_passthrough(backend, resource_passthrough("network", command))?,
+        Commands::Builder(command) => run_passthrough(backend, builder_passthrough(command))?,
+        Commands::System(command) => run_passthrough(backend, system_passthrough(command))?,
+        Commands::Machine(command) => run_passthrough(backend, machine_passthrough(command))?,
+        Commands::Completions(command) => print!("{}", render_completions(command)?),
         Commands::Version => println!("{}", crate::build_info::render()),
     }
 
     Ok(())
+}
+
+fn run_passthrough(
+    backend: &dyn ContainerBackend,
+    invocation: PassthroughInvocation,
+) -> Result<(), OrodruinError> {
+    let mut command = invocation.prefix;
+    command.extend(invocation.args);
+    let spec = AppleContainerBackend::build_passthrough_spec(command);
+    backend.run_command(&invocation.step, &spec)?;
+    Ok(())
+}
+
+fn passthrough(
+    step: &'static str,
+    prefix: &'static [&'static str],
+    args: impl Into<Vec<String>>,
+) -> PassthroughInvocation {
+    PassthroughInvocation {
+        step: step.to_string(),
+        prefix: prefix.iter().map(|value| (*value).to_string()).collect(),
+        args: args.into(),
+    }
+}
+
+fn render_completions(command: CompletionsCommand) -> Result<String, OrodruinError> {
+    let mut cli = Cli::command();
+    let mut output = Vec::new();
+    let name = cli.get_name().to_string();
+    generate(command.shell, &mut cli, name, &mut output);
+    String::from_utf8(output).map_err(|error| OrodruinError::Message(error.to_string()))
+}
+
+fn resource_passthrough(
+    resource: &str,
+    command: ResourceCommands,
+) -> PassthroughInvocation {
+    match command {
+        ResourceCommands::List(args) => passthrough_owned(format!("list {resource}s"), vec![resource, "list"], args),
+        ResourceCommands::Create(args) => passthrough_owned(format!("create {resource}"), vec![resource, "create"], args),
+        ResourceCommands::Inspect(args) => passthrough_owned(format!("inspect {resource}"), vec![resource, "inspect"], args),
+        ResourceCommands::Prune(args) => passthrough_owned(format!("prune {resource}s"), vec![resource, "prune"], args),
+        ResourceCommands::Remove(args) => passthrough_owned(format!("remove {resource}"), vec![resource, "delete"], args),
+    }
+}
+
+fn passthrough_owned(
+    step: String,
+    prefix: Vec<&str>,
+    args: impl Into<Vec<String>>,
+) -> PassthroughInvocation {
+    PassthroughInvocation {
+        step,
+        prefix: prefix.into_iter().map(str::to_string).collect(),
+        args: args.into(),
+    }
+}
+
+fn image_passthrough(command: ImageCommands) -> PassthroughInvocation {
+    match command {
+        ImageCommands::Pull(args) => passthrough("pull image", &["image", "pull"], args),
+        ImageCommands::List(args) => passthrough("list images", &["image", "list"], args),
+        ImageCommands::Inspect(args) => passthrough("inspect image", &["image", "inspect"], args),
+        ImageCommands::Load(args) => passthrough("load image", &["image", "load"], args),
+        ImageCommands::Remove(args) => passthrough("remove image", &["image", "delete"], args),
+        ImageCommands::Push(args) => passthrough("push image", &["image", "push"], args),
+        ImageCommands::Prune(args) => passthrough("prune images", &["image", "prune"], args),
+        ImageCommands::Save(args) => passthrough("save image", &["image", "save"], args),
+        ImageCommands::Tag(args) => passthrough("tag image", &["image", "tag"], args),
+    }
+}
+
+fn container_passthrough(command: ContainerCommands) -> PassthroughInvocation {
+    match command {
+        ContainerCommands::Create(args) => passthrough("create container", &["create"], args),
+        ContainerCommands::Exec(args) => passthrough("exec container command", &["exec"], args),
+        ContainerCommands::Export(args) => passthrough("export container", &["export"], args),
+        ContainerCommands::Kill(args) => passthrough("kill container", &["kill"], args),
+        ContainerCommands::List(args) => passthrough("list containers", &["list"], args),
+        ContainerCommands::Inspect(args) => passthrough("inspect container", &["inspect"], args),
+        ContainerCommands::Logs(args) => passthrough("show container logs", &["logs"], args),
+        ContainerCommands::Prune(args) => passthrough("prune containers", &["prune"], args),
+        ContainerCommands::Remove(args) => passthrough("remove container", &["delete"], args),
+        ContainerCommands::Run(args) => passthrough("run container", &["run"], args),
+        ContainerCommands::Start(args) => passthrough("start container", &["start"], args),
+        ContainerCommands::Stats(args) => passthrough("container stats", &["stats"], args),
+        ContainerCommands::Stop(args) => passthrough("stop container", &["stop"], args),
+    }
+}
+
+fn registry_passthrough(command: RegistryCommands) -> PassthroughInvocation {
+    match command {
+        RegistryCommands::List(args) => passthrough("list registries", &["registry", "list"], args),
+        RegistryCommands::Login(args) => passthrough("login registry", &["registry", "login"], args),
+        RegistryCommands::Logout(args) => passthrough("logout registry", &["registry", "logout"], args),
+    }
+}
+
+fn builder_passthrough(command: BuilderCommands) -> PassthroughInvocation {
+    match command {
+        BuilderCommands::Remove(args) => passthrough("remove builder", &["builder", "delete"], args),
+        BuilderCommands::Start(args) => passthrough("start builder", &["builder", "start"], args),
+        BuilderCommands::Status(args) => passthrough("builder status", &["builder", "status"], args),
+        BuilderCommands::Stop(args) => passthrough("stop builder", &["builder", "stop"], args),
+    }
+}
+
+fn system_passthrough(command: SystemCommands) -> PassthroughInvocation {
+    match command {
+        SystemCommands::Df(args) => passthrough("system df", &["system", "df"], args),
+        SystemCommands::Dns(args) => passthrough("system dns", &["system", "dns"], args),
+        SystemCommands::Kernel(args) => passthrough("system kernel", &["system", "kernel"], args),
+        SystemCommands::Logs(args) => passthrough("system logs", &["system", "logs"], args),
+        SystemCommands::Property(args) => passthrough("system property", &["system", "property"], args),
+        SystemCommands::Start(args) => passthrough("start system", &["system", "start"], args),
+        SystemCommands::Status(args) => passthrough("system status", &["system", "status"], args),
+        SystemCommands::Stop(args) => passthrough("stop system", &["system", "stop"], args),
+        SystemCommands::Version(args) => passthrough("system version", &["system", "version"], args),
+    }
+}
+
+fn machine_passthrough(command: MachineCommands) -> PassthroughInvocation {
+    match command {
+        MachineCommands::Create(args) => passthrough("create machine", &["machine", "create"], args),
+        MachineCommands::Inspect(args) => passthrough("inspect machine", &["machine", "inspect"], args),
+        MachineCommands::List(args) => passthrough("list machines", &["machine", "list"], args),
+        MachineCommands::Logs(args) => passthrough("machine logs", &["machine", "logs"], args),
+        MachineCommands::Remove(args) => passthrough("remove machine", &["machine", "delete"], args),
+        MachineCommands::Run(args) => passthrough("run machine command", &["machine", "run"], args),
+        MachineCommands::Set(args) => passthrough("set machine", &["machine", "set"], args),
+        MachineCommands::SetDefault(args) => passthrough("set default machine", &["machine", "set-default"], args),
+        MachineCommands::Stop(args) => passthrough("stop machine", &["machine", "stop"], args),
+    }
+}
+
+impl From<OptionalPassthroughArgs> for Vec<String> {
+    fn from(value: OptionalPassthroughArgs) -> Self {
+        value.args
+    }
+}
+
+impl From<RequiredPassthroughArgs> for Vec<String> {
+    fn from(value: RequiredPassthroughArgs) -> Self {
+        value.args
+    }
 }
 
 fn init_command() -> Result<(), OrodruinError> {
@@ -135,7 +329,7 @@ fn init_command() -> Result<(), OrodruinError> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("project");
-    fs::write(&path, default_init_config(project_name))?;
+    fs::write(&path, default_init_config(project_name)?)?;
     println!("created {}", path.display());
     Ok(())
 }
@@ -149,10 +343,54 @@ fn resolve_environment(
     loaded: &LoadedConfig,
     environment: &EnvironmentName,
 ) -> Result<ResolvedEnvironment, OrodruinError> {
-    let config = loaded.config.envs.get(&environment.env).ok_or_else(|| {
+    resolve_environment_by_name(loaded, &environment.env)
+}
+
+fn resolve_optional_environment<'a>(
+    loaded: &'a LoadedConfig,
+    env_name: Option<&'a str>,
+    command_name: &str,
+) -> Result<ResolvedEnvironment, OrodruinError> {
+    let env_name = match env_name {
+        Some(env_name) => env_name,
+        None => resolve_default_environment_name(loaded, command_name)?,
+    };
+
+    resolve_environment_by_name(loaded, env_name)
+}
+
+fn resolve_default_environment_name<'a>(
+    loaded: &'a LoadedConfig,
+    command_name: &str,
+) -> Result<&'a str, OrodruinError> {
+    if let Some(default_env) = loaded.config.project.default_env.as_deref() {
+        return Ok(default_env);
+    }
+
+    if loaded.config.envs.len() == 1 {
+        return Ok(loaded
+            .config
+            .envs
+            .keys()
+            .next()
+            .expect("single environment checked above")
+            .as_str());
+    }
+
+    Err(OrodruinError::Message(format!(
+        "`orodruin {command_name}` needs an environment name; set project.default_env in {} or define only one environment",
+        loaded.path.display(),
+    )))
+}
+
+fn resolve_environment_by_name(
+    loaded: &LoadedConfig,
+    env_name: &str,
+) -> Result<ResolvedEnvironment, OrodruinError> {
+    let config = loaded.config.envs.get(env_name).ok_or_else(|| {
         OrodruinError::Message(format!(
             "environment `{}` is not defined in {}",
-            environment.env,
+            env_name,
             loaded.path.display()
         ))
     })?;
@@ -160,7 +398,7 @@ fn resolve_environment(
     Ok(ResolvedEnvironment::resolve(
         &loaded.root,
         &loaded.config,
-        &environment.env,
+        env_name,
         config,
     ))
 }
@@ -177,6 +415,95 @@ fn resolve_run_command(
             "environment `{}` has no default command; provide one after `--`",
             resolved.environment_name
         ))
+    })
+}
+
+fn resolve_ssh_target(
+    backend: &dyn ContainerBackend,
+    resolved: &ResolvedEnvironment,
+) -> Result<String, OrodruinError> {
+    let inspect = backend
+        .inspect_raw(&resolved.container_name)?
+        .ok_or_else(|| {
+            OrodruinError::Message(format!(
+                "container `{}` is running but inspect returned no payload",
+                resolved.container_name
+            ))
+        })?;
+
+    ssh_host_from_inspect(&inspect).ok_or_else(|| {
+        OrodruinError::Message(format!(
+            "could not determine an ssh host for `{}` from container inspect output",
+            resolved.container_name
+        ))
+    })
+}
+
+fn ssh_host_from_inspect(value: &Value) -> Option<String> {
+    if let Some(host) = value
+        .get("status")
+        .and_then(|status| status.get("networks"))
+        .and_then(Value::as_array)
+        .and_then(|networks| {
+            networks
+                .iter()
+                .find_map(|network| find_ip_field(network, &["ipv4Address", "ipAddress", "address"]))
+        })
+    {
+        return Some(host);
+    }
+
+    find_ip_field(value, &["ipv4Address", "ipAddress", "ip_address", "IPAddress", "ip"])
+}
+
+fn find_ip_field(value: &Value, field_names: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for field_name in field_names {
+                if let Some(candidate) = map.get(*field_name).and_then(Value::as_str)
+                    && let Some(host) = normalize_ip(candidate)
+                {
+                    return Some(host);
+                }
+            }
+
+            map.values()
+                .find_map(|nested| find_ip_field(nested, field_names))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|nested| find_ip_field(nested, field_names)),
+        Value::String(candidate) => normalize_ip(candidate),
+        _ => None,
+    }
+}
+
+fn normalize_ip(candidate: &str) -> Option<String> {
+    let host = candidate.split('/').next()?.trim();
+    host.parse::<IpAddr>().ok().map(|_| host.to_string())
+}
+
+fn build_ssh_spec(resolved: &ResolvedEnvironment, host: &str) -> CommandSpec {
+    CommandSpec {
+        program: "ssh".into(),
+        args: vec![format!("{}@{host}", resolved.user.username)],
+    }
+}
+
+fn run_host_command(spec: &CommandSpec) -> Result<(), OrodruinError> {
+    let status = ProcessCommand::new(&spec.program)
+        .args(&spec.args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(OrodruinError::CommandFailed {
+        command: spec.render(),
+        status: status.code(),
     })
 }
 
@@ -293,7 +620,11 @@ else
     fi
 
     if command -v useradd >/dev/null 2>&1; then
-        useradd -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"
+        if useradd -K UID_MIN=0 -K UID_MAX=60000 -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"; then
+            :
+        else
+            useradd -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"
+        fi
     elif command -v adduser >/dev/null 2>&1; then
         adduser -D -h "$home" -u "$uid" -G "$group_name" "$username"
     else
@@ -339,8 +670,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        backend::BackendError,
-        cli::Commands,
+        backend::{BackendError, CommandSpec},
+        cli::{
+            BuilderCommands, Commands, ContainerCommands, EnterCommand, ImageCommands,
+            MachineCommands, OptionalPassthroughArgs, RegistryCommands, ResourceCommands,
+            SshCommand, SystemCommands,
+        },
         config::{EnvironmentConfig, ProjectMetadata},
         env_model::ResolvedBuild,
     };
@@ -356,6 +691,7 @@ mod tests {
         execs: RefCell<Vec<ExecRequest>>,
         exec_results: RefCell<VecDeque<Result<(), BackendError>>>,
         builds: RefCell<Vec<String>>,
+        commands: RefCell<Vec<(String, CommandSpec)>>,
     }
 
     impl MockBackend {
@@ -439,6 +775,13 @@ mod tests {
             self.deleted.borrow_mut().push(container_name.to_string());
             Ok(())
         }
+
+        fn run_command(&self, step: &str, spec: &CommandSpec) -> Result<(), BackendError> {
+            self.commands
+                .borrow_mut()
+                .push((step.to_string(), spec.clone()));
+            Ok(())
+        }
     }
 
     fn write_config(root: &Path) {
@@ -509,7 +852,9 @@ mod tests {
         let cli = Cli {
             debug: false,
             config: None,
-            command: Commands::Enter(EnvironmentName { env: "dev".into() }),
+            command: Commands::Enter(EnterCommand {
+                env: Some("dev".into()),
+            }),
         };
 
         run_with_backend(cli, &backend).unwrap();
@@ -545,7 +890,9 @@ mod tests {
         let cli = Cli {
             debug: false,
             config: None,
-            command: Commands::Enter(EnvironmentName { env: "dev".into() }),
+            command: Commands::Enter(EnterCommand {
+                env: Some("dev".into()),
+            }),
         };
 
         run_with_backend(cli, &backend).unwrap();
@@ -676,6 +1023,7 @@ mod tests {
         let project = ProjectConfig {
             project: ProjectMetadata {
                 name: Some("Demo".into()),
+                default_env: None,
             },
             envs: Default::default(),
         };
@@ -707,14 +1055,17 @@ mod tests {
         let cli = Cli {
             debug: false,
             config: None,
-            command: Commands::Enter(EnvironmentName { env: "dev".into() }),
+            command: Commands::Enter(EnterCommand {
+                env: Some("dev".into()),
+            }),
         };
 
         run_with_backend(cli, &backend).unwrap();
 
         let execs = backend.execs.borrow();
         assert_eq!(execs[0].command[0], "/bin/sh");
-        assert!(execs[0].command[2].contains("useradd"));
+        assert!(execs[0].command[2].contains("useradd -K UID_MIN=0 -K UID_MAX=60000"));
+        assert!(execs[0].command[2].contains("useradd -m -d \"$home\" -u \"$uid\" -g \"$gid\" -s /bin/sh \"$username\""));
         assert_eq!(execs[0].user, None);
         assert_eq!(
             execs[1].env.iter().find(|(key, _)| key == "HOME"),
@@ -723,5 +1074,491 @@ mod tests {
                 format!("/home/{}", execs[1].user.as_ref().unwrap().username)
             ))
         );
+    }
+
+    #[test]
+    fn pull_dispatches_to_image_pull() {
+        let backend = MockBackend::default();
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Pull(RequiredPassthroughArgs {
+                args: vec!["alpine:latest".into()],
+            }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].0, "pull image");
+        assert_eq!(commands[0].1.args, ["image", "pull", "alpine:latest"]);
+    }
+
+    #[test]
+    fn ps_dispatches_to_container_list() {
+        let backend = MockBackend::default();
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Ps(OptionalPassthroughArgs {
+                args: vec!["--all".into()],
+            }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].0, "list containers");
+        assert_eq!(commands[0].1.args, ["list", "--all"]);
+    }
+
+    #[test]
+    fn nested_registry_and_resource_commands_map_to_container_cli() {
+        let backend = MockBackend::default();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
+                    args: vec![],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Image(ImageCommands::Prune(OptionalPassthroughArgs {
+                    args: vec![],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Volume(ResourceCommands::Remove(RequiredPassthroughArgs {
+                    args: vec!["cache".into()],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].1.args, ["registry", "list"]);
+        assert_eq!(commands[1].1.args, ["image", "prune"]);
+        assert_eq!(commands[2].1.args, ["volume", "delete", "cache"]);
+    }
+
+    #[test]
+    fn nested_image_commands_map_to_container_cli() {
+        let backend = MockBackend::default();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Image(ImageCommands::Inspect(RequiredPassthroughArgs {
+                    args: vec!["alpine:latest".into()],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Image(ImageCommands::Push(RequiredPassthroughArgs {
+                    args: vec!["demo:latest".into()],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Image(ImageCommands::Tag(RequiredPassthroughArgs {
+                    args: vec!["demo:latest".into(), "demo:v1".into()],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].1.args, ["image", "inspect", "alpine:latest"]);
+        assert_eq!(commands[1].1.args, ["image", "push", "demo:latest"]);
+        assert_eq!(commands[2].1.args, ["image", "tag", "demo:latest", "demo:v1"]);
+    }
+
+    #[test]
+    fn image_load_and_save_map_to_container_cli() {
+        let backend = MockBackend::default();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Image(ImageCommands::Load(OptionalPassthroughArgs {
+                    args: vec!["-i".into(), "image.tar".into()],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Image(ImageCommands::Save(OptionalPassthroughArgs {
+                    args: vec!["-o".into(), "image.tar".into(), "demo:latest".into()],
+                })),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].1.args, ["image", "load", "-i", "image.tar"]);
+        assert_eq!(commands[1].1.args, ["image", "save", "-o", "image.tar", "demo:latest"]);
+    }
+
+    #[test]
+    fn nested_container_commands_map_to_container_cli() {
+        let backend = MockBackend::default();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Container(ContainerCommands::Inspect(
+                    RequiredPassthroughArgs {
+                        args: vec!["demo".into()],
+                    },
+                )),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Container(ContainerCommands::Start(
+                    RequiredPassthroughArgs {
+                        args: vec!["demo".into()],
+                    },
+                )),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Container(ContainerCommands::Stop(
+                    RequiredPassthroughArgs {
+                        args: vec!["demo".into()],
+                    },
+                )),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        run_with_backend(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Container(ContainerCommands::Prune(
+                    OptionalPassthroughArgs { args: vec![] },
+                )),
+            },
+            &backend,
+        )
+        .unwrap();
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].1.args, ["inspect", "demo"]);
+        assert_eq!(commands[1].1.args, ["start", "demo"]);
+        assert_eq!(commands[2].1.args, ["stop", "demo"]);
+        assert_eq!(commands[3].1.args, ["prune"]);
+    }
+
+    #[test]
+    fn extended_container_commands_map_to_container_cli() {
+        let backend = MockBackend::default();
+
+        for command in [
+            Commands::Container(ContainerCommands::Create(OptionalPassthroughArgs {
+                args: vec!["--name".into(), "demo".into(), "alpine".into()],
+            })),
+            Commands::Container(ContainerCommands::Run(OptionalPassthroughArgs {
+                args: vec!["--rm".into(), "alpine".into(), "echo".into(), "hi".into()],
+            })),
+            Commands::Container(ContainerCommands::Exec(OptionalPassthroughArgs {
+                args: vec!["demo".into(), "sh".into()],
+            })),
+            Commands::Container(ContainerCommands::Kill(OptionalPassthroughArgs {
+                args: vec!["demo".into()],
+            })),
+            Commands::Container(ContainerCommands::Stats(OptionalPassthroughArgs {
+                args: vec!["demo".into()],
+            })),
+            Commands::Container(ContainerCommands::Export(OptionalPassthroughArgs {
+                args: vec!["demo".into()],
+            })),
+        ] {
+            run_with_backend(
+                Cli {
+                    debug: false,
+                    config: None,
+                    command,
+                },
+                &backend,
+            )
+            .unwrap();
+        }
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].1.args, ["create", "--name", "demo", "alpine"]);
+        assert_eq!(commands[1].1.args, ["run", "--rm", "alpine", "echo", "hi"]);
+        assert_eq!(commands[2].1.args, ["exec", "demo", "sh"]);
+        assert_eq!(commands[3].1.args, ["kill", "demo"]);
+        assert_eq!(commands[4].1.args, ["stats", "demo"]);
+        assert_eq!(commands[5].1.args, ["export", "demo"]);
+    }
+
+    #[test]
+    fn builder_system_and_machine_commands_map_to_container_cli() {
+        let backend = MockBackend::default();
+
+        for command in [
+            Commands::Builder(BuilderCommands::Status(OptionalPassthroughArgs { args: vec![] })),
+            Commands::System(SystemCommands::Version(OptionalPassthroughArgs { args: vec![] })),
+            Commands::Machine(MachineCommands::List(OptionalPassthroughArgs { args: vec![] })),
+            Commands::Machine(MachineCommands::SetDefault(OptionalPassthroughArgs {
+                args: vec!["desktop".into()],
+            })),
+        ] {
+            run_with_backend(
+                Cli {
+                    debug: false,
+                    config: None,
+                    command,
+                },
+                &backend,
+            )
+            .unwrap();
+        }
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].1.args, ["builder", "status"]);
+        assert_eq!(commands[1].1.args, ["system", "version"]);
+        assert_eq!(commands[2].1.args, ["machine", "list"]);
+        assert_eq!(commands[3].1.args, ["machine", "set-default", "desktop"]);
+    }
+
+    #[test]
+    fn enter_uses_project_default_env_when_omitted() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+                default_env = "ci"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+
+                [envs.ci]
+                build = { context = ".", file = "Containerfile", tag = "demo-ci:dev" }
+            "#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Enter(EnterCommand { env: None }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+        assert_eq!(backend.builds.borrow().as_slice(), ["demo-ci:dev"]);
+    }
+
+    #[test]
+    fn ssh_print_uses_project_default_env_when_omitted() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+                default_env = "ci"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+
+                [envs.ci]
+                build = { context = ".", file = "Containerfile", tag = "demo-ci:dev" }
+            "#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+        let container_name = resolved_name(tempdir.path(), "ci");
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+        *backend.inspect_value.borrow_mut() = Some(json!({
+            "status": {
+                "networks": [{ "ipv4Address": "192.168.64.2/24" }]
+            }
+        }));
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Ssh(SshCommand {
+                env: None,
+                print: true,
+            }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+        assert_eq!(backend.builds.borrow().as_slice(), ["demo-ci:dev"]);
+        assert_eq!(backend.inspect_calls.borrow().as_slice(), [container_name]);
+    }
+
+    #[test]
+    fn enter_uses_single_environment_when_omitted() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+                shell = ["/bin/bash"]
+            "#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+        let container_name = resolved_name(tempdir.path(), "dev");
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Enter(EnterCommand { env: None }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+        assert_eq!(backend.created.borrow().as_slice(), [container_name]);
+    }
+
+    #[test]
+    fn enter_without_env_errors_when_ambiguous() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::default();
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Enter(EnterCommand { env: None }),
+        };
+
+        let error = run_with_backend(cli, &backend).unwrap_err();
+        assert!(error.to_string().contains("set project.default_env"));
+    }
+
+    #[test]
+    fn ssh_without_env_errors_when_ambiguous() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::default();
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Ssh(SshCommand {
+                env: None,
+                print: true,
+            }),
+        };
+
+        let error = run_with_backend(cli, &backend).unwrap_err();
+        assert!(error.to_string().contains("`orodruin ssh` needs an environment name"));
+    }
+
+    #[test]
+    fn ssh_host_uses_network_ipv4_address_without_cidr() {
+        let host = ssh_host_from_inspect(&json!({
+            "status": {
+                "networks": [{
+                    "ipv4Address": "192.168.64.2/24",
+                    "ipv6Address": "fdc8:9ac1:53c8:9dd2:f85b:11ff:fe51:30c9/64"
+                }]
+            }
+        }));
+
+        assert_eq!(host.as_deref(), Some("192.168.64.2"));
+    }
+
+    #[test]
+    fn ssh_print_errors_when_inspect_has_no_ip() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+        *backend.inspect_value.borrow_mut() = Some(json!({ "status": { "state": "running" } }));
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Ssh(SshCommand {
+                env: Some("dev".into()),
+                print: true,
+            }),
+        };
+
+        let error = run_with_backend(cli, &backend).unwrap_err();
+        assert!(error.to_string().contains("could not determine an ssh host"));
+    }
+
+    #[test]
+    fn completions_render_current_subcommands() {
+        let output = render_completions(CompletionsCommand {
+            shell: clap_complete::Shell::Bash,
+        })
+        .unwrap();
+
+        assert!(output.contains("completions"));
+        assert!(output.contains("orodruin"));
+        assert!(output.contains("inspect"));
+        assert!(output.contains("ssh"));
     }
 }

@@ -44,6 +44,7 @@ pub trait ContainerBackend {
     fn start(&self, container_name: &str) -> Result<(), BackendError>;
     fn exec(&self, container_name: &str, request: &ExecRequest) -> Result<(), BackendError>;
     fn delete(&self, container_name: &str) -> Result<(), BackendError>;
+    fn run_command(&self, step: &str, spec: &CommandSpec) -> Result<(), BackendError>;
 }
 
 pub struct AppleContainerBackend {
@@ -143,6 +144,13 @@ impl AppleContainerBackend {
         }
     }
 
+    pub fn build_passthrough_spec(args: Vec<String>) -> CommandSpec {
+        CommandSpec {
+            program: "container".into(),
+            args,
+        }
+    }
+
     fn run_captured(&self, step: &str, spec: &CommandSpec) -> Result<String, BackendError> {
         if self.debug {
             eprintln!("debug: {}", spec.render());
@@ -234,6 +242,10 @@ impl ContainerBackend for AppleContainerBackend {
     fn delete(&self, container_name: &str) -> Result<(), BackendError> {
         self.run_interactive("delete container", &Self::build_delete_spec(container_name))
     }
+
+    fn run_command(&self, step: &str, spec: &CommandSpec) -> Result<(), BackendError> {
+        self.run_interactive(step, spec)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -262,10 +274,8 @@ impl BackendError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::CommandFailed {
-                step,
-                status: Some(code),
-                ..
-            } if step == "exec command" => *code,
+                status: Some(code), ..
+            } => *code,
             _ => 1,
         }
     }
@@ -408,5 +418,17 @@ mod tests {
         };
 
         assert_eq!(spec.render(), "container exec demo 'echo hello'");
+    }
+
+    #[test]
+    fn passthrough_spec_uses_container_binary() {
+        let spec = AppleContainerBackend::build_passthrough_spec(vec![
+            "image".into(),
+            "pull".into(),
+            "alpine:latest".into(),
+        ]);
+
+        assert_eq!(spec.program, "container");
+        assert_eq!(spec.args, ["image", "pull", "alpine:latest"]);
     }
 }

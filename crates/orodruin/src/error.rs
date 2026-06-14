@@ -8,6 +8,8 @@ use crate::{backend::BackendError, config::ConfigError};
 pub enum OrodruinError {
     #[error("{0}")]
     Message(String),
+    #[error("`{command}` failed with exit status {status:?}")]
+    CommandFailed { command: String, status: Option<i32> },
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -20,6 +22,9 @@ impl OrodruinError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Backend(error) => error.exit_code(),
+            Self::CommandFailed {
+                status: Some(code), ..
+            } => *code,
             _ => 1,
         }
     }

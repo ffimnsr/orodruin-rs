@@ -254,6 +254,7 @@ mod tests {
         let project = ProjectConfig {
             project: ProjectMetadata {
                 name: Some("My App".into()),
+                default_env: None,
             },
             envs: Default::default(),
         };

@@ -19,6 +19,7 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProjectMetadata {
     pub name: Option<String>,
+    pub default_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -77,6 +78,8 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to serialize default config: {0}")]
+    Serialize(#[from] toml::ser::Error),
     #[error("invalid config: {0}")]
     Validation(String),
 }
@@ -116,6 +119,19 @@ impl ProjectConfig {
             return Err(ConfigError::Validation(
                 "define at least one environment under [envs.<name>]".into(),
             ));
+        }
+
+        if let Some(default_env) = self.project.default_env.as_deref() {
+            if default_env.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "project.default_env must not be empty".into(),
+                ));
+            }
+            if !self.envs.contains_key(default_env) {
+                return Err(ConfigError::Validation(format!(
+                    "project.default_env `{default_env}` is not defined under [envs.<name>]"
+                )));
+            }
         }
 
         for (name, env) in &self.envs {
@@ -185,20 +201,33 @@ impl ProjectConfig {
     }
 }
 
-pub fn default_init_config(project_name: &str) -> String {
-    format!(
-        r#"[project]
-name = "{project_name}"
+pub fn default_init_config(project_name: &str) -> Result<String, ConfigError> {
+    let mut envs = BTreeMap::new();
+    envs.insert(
+        "dev".to_string(),
+        EnvironmentConfig {
+            image: Some("ubuntu:latest".into()),
+            build: None,
+            container_name: None,
+            project_mount: Some(format!("/workspace/{project_name}")),
+            workdir: Some(format!("/workspace/{project_name}")),
+            env: BTreeMap::new(),
+            preserve_env: vec!["SSH_AUTH_SOCK".into()],
+            mounts: vec![],
+            shell: Some(vec!["/bin/bash".into()]),
+            startup_command: Some(vec!["sleep".into(), "infinity".into()]),
+            default_command: None,
+        },
+    );
 
-[envs.dev]
-image = "ubuntu:latest"
-project_mount = "/workspace/{project_name}"
-workdir = "/workspace/{project_name}"
-preserve_env = ["SSH_AUTH_SOCK"]
-shell = ["/bin/bash"]
-startup_command = ["sleep", "infinity"]
-"#
-    )
+    toml::to_string_pretty(&ProjectConfig {
+        project: ProjectMetadata {
+            name: Some(project_name.to_string()),
+            default_env: None,
+        },
+        envs,
+    })
+    .map_err(ConfigError::from)
 }
 
 fn validate_absolute_path(env_name: &str, field: &str, path: &str) -> Result<(), ConfigError> {
@@ -290,5 +319,38 @@ mod tests {
                 .to_string()
                 .contains("must define exactly one of `image` or `build`")
         );
+    }
+
+    #[test]
+    fn rejects_unknown_default_env() {
+        let config: ProjectConfig = toml::from_str(
+            r#"
+                [project]
+                default_env = "ci"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+            "#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("project.default_env `ci` is not defined")
+        );
+    }
+
+    #[test]
+    fn default_init_config_serializes_escaped_project_name() {
+        let rendered = default_init_config("demo \"quoted\"").unwrap();
+        let config: ProjectConfig = toml::from_str(&rendered).unwrap();
+
+        assert_eq!(config.project.name.as_deref(), Some("demo \"quoted\""));
+        let env = config.envs.get("dev").unwrap();
+        assert_eq!(env.project_mount.as_deref(), Some("/workspace/demo \"quoted\""));
+        assert_eq!(env.workdir.as_deref(), Some("/workspace/demo \"quoted\""));
+        assert_eq!(env.shell.as_deref(), Some([String::from("/bin/bash")].as_slice()));
     }
 }
