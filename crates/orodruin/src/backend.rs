@@ -11,6 +11,33 @@ use crate::{
     state::{ContainerSummary, StateError, parse_inspect_output, parse_list_output},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerRuntime {
+    AppleContainer,
+    Podman,
+}
+
+impl ContainerRuntime {
+    pub fn from_os(os: &str) -> Option<Self> {
+        match os {
+            "macos" => Some(Self::AppleContainer),
+            "linux" => Some(Self::Podman),
+            _ => None,
+        }
+    }
+
+    pub fn program(self) -> &'static str {
+        match self {
+            Self::AppleContainer => "container",
+            Self::Podman => "podman",
+        }
+    }
+
+    pub fn manages_system_lifecycle(self) -> bool {
+        matches!(self, Self::AppleContainer)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: String,
@@ -49,37 +76,44 @@ pub trait ContainerBackend {
     fn run_command(&self, step: &str, spec: &CommandSpec) -> Result<(), BackendError>;
 }
 
-pub struct AppleContainerBackend {
+pub struct ContainerCliBackend {
     debug: bool,
+    runtime: ContainerRuntime,
 }
 
-impl AppleContainerBackend {
-    pub fn new(debug: bool) -> Self {
-        Self { debug }
+impl ContainerCliBackend {
+    pub fn new(debug: bool, runtime: ContainerRuntime) -> Self {
+        Self { debug, runtime }
     }
 
-    pub fn build_list_spec() -> CommandSpec {
-        CommandSpec {
-            program: "container".into(),
-            args: vec![
-                "list".into(),
-                "--all".into(),
-                "--format".into(),
-                "json".into(),
-            ],
+    pub fn build_list_spec(runtime: ContainerRuntime) -> CommandSpec {
+        match runtime {
+            ContainerRuntime::AppleContainer => CommandSpec {
+                program: runtime.program().into(),
+                args: vec![
+                    "list".into(),
+                    "--all".into(),
+                    "--format".into(),
+                    "json".into(),
+                ],
+            },
+            ContainerRuntime::Podman => CommandSpec {
+                program: runtime.program().into(),
+                args: vec!["ps".into(), "--all".into(), "--format".into(), "json".into()],
+            },
         }
     }
 
-    pub fn build_inspect_spec(container_name: &str) -> CommandSpec {
+    pub fn build_inspect_spec(runtime: ContainerRuntime, container_name: &str) -> CommandSpec {
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args: vec!["inspect".into(), container_name.into()],
         }
     }
 
-    pub fn build_system_status_spec() -> CommandSpec {
+    pub fn build_system_status_spec(runtime: ContainerRuntime) -> CommandSpec {
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args: vec![
                 "system".into(),
                 "status".into(),
@@ -89,14 +123,14 @@ impl AppleContainerBackend {
         }
     }
 
-    pub fn build_system_start_spec() -> CommandSpec {
+    pub fn build_system_start_spec(runtime: ContainerRuntime) -> CommandSpec {
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args: vec!["system".into(), "start".into()],
         }
     }
 
-    pub fn build_build_spec(build: &ResolvedBuild) -> CommandSpec {
+    pub fn build_build_spec(runtime: ContainerRuntime, build: &ResolvedBuild) -> CommandSpec {
         let mut args = vec!["build".into(), "-t".into(), build.tag.clone()];
         if let Some(file) = &build.file {
             args.push("-f".into());
@@ -104,12 +138,15 @@ impl AppleContainerBackend {
         }
         args.push(build.context.display().to_string());
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args,
         }
     }
 
-    pub fn build_create_spec(environment: &ResolvedEnvironment) -> CommandSpec {
+    pub fn build_create_spec(
+        runtime: ContainerRuntime,
+        environment: &ResolvedEnvironment,
+    ) -> CommandSpec {
         let mut args = vec![
             "run".into(),
             "-d".into(),
@@ -123,19 +160,23 @@ impl AppleContainerBackend {
         args.push(environment.image.clone());
         args.extend(environment.startup_command.iter().cloned());
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args,
         }
     }
 
-    pub fn build_start_spec(container_name: &str) -> CommandSpec {
+    pub fn build_start_spec(runtime: ContainerRuntime, container_name: &str) -> CommandSpec {
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args: vec!["start".into(), container_name.into()],
         }
     }
 
-    pub fn build_exec_spec(container_name: &str, request: &ExecRequest) -> CommandSpec {
+    pub fn build_exec_spec(
+        runtime: ContainerRuntime,
+        container_name: &str,
+        request: &ExecRequest,
+    ) -> CommandSpec {
         let mut args = vec!["exec".into()];
         if request.interactive {
             args.push("-i".into());
@@ -153,21 +194,27 @@ impl AppleContainerBackend {
         args.push(container_name.into());
         args.extend(request.command.iter().cloned());
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args,
         }
     }
 
-    pub fn build_delete_spec(container_name: &str) -> CommandSpec {
+    pub fn build_delete_spec(runtime: ContainerRuntime, container_name: &str) -> CommandSpec {
+        let args = match runtime {
+            ContainerRuntime::AppleContainer => {
+                vec!["delete".into(), "--force".into(), container_name.into()]
+            }
+            ContainerRuntime::Podman => vec!["rm".into(), "--force".into(), container_name.into()],
+        };
         CommandSpec {
-            program: "container".into(),
-            args: vec!["delete".into(), "--force".into(), container_name.into()],
+            program: runtime.program().into(),
+            args,
         }
     }
 
-    pub fn build_passthrough_spec(args: Vec<String>) -> CommandSpec {
+    pub fn build_passthrough_spec(runtime: ContainerRuntime, args: Vec<String>) -> CommandSpec {
         CommandSpec {
-            program: "container".into(),
+            program: runtime.program().into(),
             args,
         }
     }
@@ -224,22 +271,29 @@ impl AppleContainerBackend {
     }
 }
 
-impl ContainerBackend for AppleContainerBackend {
+impl ContainerBackend for ContainerCliBackend {
     fn list_all(&self) -> Result<Vec<ContainerSummary>, BackendError> {
-        let output = self.run_captured("list containers", &Self::build_list_spec())?;
+        let output = self.run_captured("list containers", &Self::build_list_spec(self.runtime))?;
         parse_list_output(&output).map_err(BackendError::from)
     }
 
     fn inspect_raw(&self, container_name: &str) -> Result<Option<Value>, BackendError> {
         let output = self.run_captured(
             "inspect container",
-            &Self::build_inspect_spec(container_name),
+            &Self::build_inspect_spec(self.runtime, container_name),
         )?;
         Ok(parse_inspect_output(&output))
     }
 
     fn system_running(&self) -> Result<bool, BackendError> {
-        match self.run_captured("check system status", &Self::build_system_status_spec()) {
+        if !self.runtime.manages_system_lifecycle() {
+            return Ok(true);
+        }
+
+        match self.run_captured(
+            "check system status",
+            &Self::build_system_status_spec(self.runtime),
+        ) {
             Ok(output) => Ok(system_status_reports_running(&output)),
             Err(BackendError::CommandFailed { .. }) => Ok(false),
             Err(error) => Err(error),
@@ -247,33 +301,43 @@ impl ContainerBackend for AppleContainerBackend {
     }
 
     fn start_system(&self) -> Result<(), BackendError> {
-        self.run_interactive("start system", &Self::build_system_start_spec())
+        if !self.runtime.manages_system_lifecycle() {
+            return Ok(());
+        }
+
+        self.run_interactive("start system", &Self::build_system_start_spec(self.runtime))
     }
 
     fn build_image(&self, build: &ResolvedBuild) -> Result<(), BackendError> {
-        self.run_interactive("build image", &Self::build_build_spec(build))
+        self.run_interactive("build image", &Self::build_build_spec(self.runtime, build))
     }
 
     fn create(&self, environment: &ResolvedEnvironment) -> Result<(), BackendError> {
         self.run_interactive(
             "create and start container",
-            &Self::build_create_spec(environment),
+            &Self::build_create_spec(self.runtime, environment),
         )
     }
 
     fn start(&self, container_name: &str) -> Result<(), BackendError> {
-        self.run_interactive("start container", &Self::build_start_spec(container_name))
+        self.run_interactive(
+            "start container",
+            &Self::build_start_spec(self.runtime, container_name),
+        )
     }
 
     fn exec(&self, container_name: &str, request: &ExecRequest) -> Result<(), BackendError> {
         self.run_interactive(
             "exec command",
-            &Self::build_exec_spec(container_name, request),
+            &Self::build_exec_spec(self.runtime, container_name, request),
         )
     }
 
     fn delete(&self, container_name: &str) -> Result<(), BackendError> {
-        self.run_interactive("delete container", &Self::build_delete_spec(container_name))
+        self.run_interactive(
+            "delete container",
+            &Self::build_delete_spec(self.runtime, container_name),
+        )
     }
 
     fn run_command(&self, step: &str, spec: &CommandSpec) -> Result<(), BackendError> {
@@ -424,7 +488,7 @@ mod tests {
     #[test]
     fn create_emits_expected_container_command() {
         let environment = sample_environment();
-        let spec = AppleContainerBackend::build_create_spec(&environment);
+        let spec = ContainerCliBackend::build_create_spec(ContainerRuntime::AppleContainer, &environment);
 
         assert_eq!(spec.program, "container");
         assert_eq!(spec.args[0], "run");
@@ -443,7 +507,8 @@ mod tests {
 
     #[test]
     fn exec_targets_container_workdir_and_command() {
-        let spec = AppleContainerBackend::build_exec_spec(
+        let spec = ContainerCliBackend::build_exec_spec(
+            ContainerRuntime::AppleContainer,
             "orodruin-app-123",
             &ExecRequest {
                 workdir: Some("/workspace/app".into()),
@@ -479,7 +544,9 @@ mod tests {
 
     #[test]
     fn passthrough_spec_uses_container_binary() {
-        let spec = AppleContainerBackend::build_passthrough_spec(vec![
+        let spec = ContainerCliBackend::build_passthrough_spec(
+            ContainerRuntime::AppleContainer,
+            vec![
             "image".into(),
             "pull".into(),
             "alpine:latest".into(),
@@ -487,5 +554,17 @@ mod tests {
 
         assert_eq!(spec.program, "container");
         assert_eq!(spec.args, ["image", "pull", "alpine:latest"]);
+    }
+
+    #[test]
+    fn podman_specs_use_linux_command_shape() {
+        let list_spec = ContainerCliBackend::build_list_spec(ContainerRuntime::Podman);
+        let delete_spec =
+            ContainerCliBackend::build_delete_spec(ContainerRuntime::Podman, "demo");
+
+        assert_eq!(list_spec.program, "podman");
+        assert_eq!(list_spec.args, ["ps", "--all", "--format", "json"]);
+        assert_eq!(delete_spec.program, "podman");
+        assert_eq!(delete_spec.args, ["rm", "--force", "demo"]);
     }
 }

@@ -7,12 +7,11 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
 };
 
-use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use serde_json::{Value, to_string_pretty};
 
 use crate::{
-    backend::{AppleContainerBackend, BackendError, CommandSpec, ContainerBackend, ExecRequest},
+    backend::{BackendError, CommandSpec, ContainerBackend, ContainerCliBackend, ContainerRuntime, ExecRequest},
     cli::{
         BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, EnvironmentName,
         ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
@@ -26,8 +25,7 @@ use crate::{
 
 struct PassthroughInvocation {
     step: String,
-    prefix: Vec<String>,
-    args: Vec<String>,
+    command: Vec<String>,
 }
 
 pub fn run<I, T>(args: I) -> Result<(), OrodruinError>
@@ -35,12 +33,21 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = Cli::parse_from(args);
-    let backend = AppleContainerBackend::new(cli.debug);
-    run_with_backend(cli, &backend)
+    let runtime = runtime_for_os(std::env::consts::OS)?;
+    let cli = Cli::parse_for_runtime(args, runtime).unwrap_or_else(|error| error.exit());
+    let backend = ContainerCliBackend::new(cli.debug, runtime);
+    run_with_backend_for_runtime(cli, &backend, runtime)
 }
 
 fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), OrodruinError> {
+    run_with_backend_for_runtime(cli, backend, ContainerRuntime::AppleContainer)
+}
+
+fn run_with_backend_for_runtime(
+    cli: Cli,
+    backend: &dyn ContainerBackend,
+    runtime: ContainerRuntime,
+) -> Result<(), OrodruinError> {
     match cli.command {
         Commands::Init => init_command()?,
         Commands::Create(environment) => {
@@ -53,7 +60,7 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
             let loaded = load_config(cli.config.as_deref())?;
             let resolved =
                 resolve_optional_environment(&loaded, environment.env.as_deref(), "enter")?;
-            ensure_container_system_running(backend)?;
+            ensure_container_system_running(backend, runtime)?;
             materialize_environment(backend, &resolved)?;
             ensure_container_user(backend, &resolved)?;
             match backend.exec(
@@ -149,49 +156,47 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
             }
         }
         Commands::Pull(args) => {
-            run_passthrough(backend, passthrough("pull image", &["image", "pull"], args))?
+            run_passthrough(backend, runtime, pull_passthrough(runtime, args))?
         }
-        Commands::Images(args) => run_passthrough(
-            backend,
-            passthrough("list images", &["image", "list"], args),
-        )?,
-        Commands::Rmi(args) => run_passthrough(
-            backend,
-            passthrough("remove image", &["image", "delete"], args),
-        )?,
+        Commands::Images(args) => run_passthrough(backend, runtime, images_passthrough(runtime, args))?,
+        Commands::Rmi(args) => run_passthrough(backend, runtime, rmi_passthrough(runtime, args))?,
         Commands::Ps(args) => {
-            run_passthrough(backend, passthrough("list containers", &["list"], args))?
+            run_passthrough(backend, runtime, ps_passthrough(runtime, args))?
         }
         Commands::Logs(args) => {
-            run_passthrough(backend, passthrough("show container logs", &["logs"], args))?
+            run_passthrough(backend, runtime, logs_passthrough(runtime, args))?
         }
         Commands::Build(args) => {
-            run_passthrough(backend, passthrough("build image", &["build"], args))?
+            run_passthrough(backend, runtime, build_passthrough(runtime, args))?
         }
         Commands::Copy(args) => {
-            run_passthrough(backend, passthrough("copy files", &["copy"], args))?
+            run_passthrough(backend, runtime, copy_passthrough(runtime, args))?
         }
-        Commands::Login(args) => run_passthrough(
-            backend,
-            passthrough("login registry", &["registry", "login"], args),
-        )?,
-        Commands::Logout(args) => run_passthrough(
-            backend,
-            passthrough("logout registry", &["registry", "logout"], args),
-        )?,
-        Commands::Image(command) => run_passthrough(backend, image_passthrough(command))?,
-        Commands::Container(command) => run_passthrough(backend, container_passthrough(command))?,
-        Commands::Registry(command) => run_passthrough(backend, registry_passthrough(command))?,
+        Commands::Login(args) => run_passthrough(backend, runtime, login_passthrough(runtime, args))?,
+        Commands::Logout(args) => run_passthrough(backend, runtime, logout_passthrough(runtime, args))?,
+        Commands::Image(command) => run_passthrough(backend, runtime, image_passthrough(runtime, command)?)?,
+        Commands::Container(command) => {
+            run_passthrough(backend, runtime, container_passthrough(runtime, command))?
+        }
+        Commands::Registry(command) => {
+            run_passthrough(backend, runtime, registry_passthrough(runtime, command)?)?
+        }
         Commands::Volume(command) => {
-            run_passthrough(backend, resource_passthrough("volume", command))?
+            run_passthrough(backend, runtime, resource_passthrough(runtime, "volume", command))?
         }
         Commands::Network(command) => {
-            run_passthrough(backend, resource_passthrough("network", command))?
+            run_passthrough(backend, runtime, resource_passthrough(runtime, "network", command))?
         }
-        Commands::Builder(command) => run_passthrough(backend, builder_passthrough(command))?,
-        Commands::System(command) => run_passthrough(backend, system_passthrough(command))?,
-        Commands::Machine(command) => run_passthrough(backend, machine_passthrough(command))?,
-        Commands::Completions(command) => print!("{}", render_completions(command)?),
+        Commands::Builder(command) => {
+            run_passthrough(backend, runtime, builder_passthrough(runtime, command)?)?
+        }
+        Commands::System(command) => {
+            run_passthrough(backend, runtime, system_passthrough(runtime, command)?)?
+        }
+        Commands::Machine(command) => {
+            run_passthrough(backend, runtime, machine_passthrough(runtime, command)?)?
+        }
+        Commands::Completions(command) => print!("{}", render_completions(runtime, command)?),
         Commands::Version => println!("{}", crate::build_info::render()),
     }
 
@@ -200,39 +205,69 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
 
 fn run_passthrough(
     backend: &dyn ContainerBackend,
+    runtime: ContainerRuntime,
     invocation: PassthroughInvocation,
 ) -> Result<(), OrodruinError> {
-    let mut command = invocation.prefix;
-    command.extend(invocation.args);
-    let spec = AppleContainerBackend::build_passthrough_spec(command);
+    let spec = ContainerCliBackend::build_passthrough_spec(runtime, invocation.command);
     backend.run_command(&invocation.step, &spec)?;
     Ok(())
 }
 
-fn passthrough(
-    step: &'static str,
-    prefix: &'static [&'static str],
-    args: impl Into<Vec<String>>,
-) -> PassthroughInvocation {
+fn passthrough(step: impl Into<String>, command: Vec<String>) -> PassthroughInvocation {
     PassthroughInvocation {
-        step: step.to_string(),
-        prefix: prefix.iter().map(|value| (*value).to_string()).collect(),
-        args: args.into(),
+        step: step.into(),
+        command,
     }
 }
 
-fn render_completions(command: CompletionsCommand) -> Result<String, OrodruinError> {
-    let mut cli = Cli::command();
+fn passthrough_with_args(
+    step: impl Into<String>,
+    prefix: Vec<&str>,
+    args: impl Into<Vec<String>>,
+) -> PassthroughInvocation {
+    let mut command = prefix.into_iter().map(str::to_string).collect::<Vec<_>>();
+    command.extend(args.into());
+    passthrough(step, command)
+}
+
+fn runtime_for_os(os: &str) -> Result<ContainerRuntime, OrodruinError> {
+    ContainerRuntime::from_os(os).ok_or_else(|| {
+        OrodruinError::Message(format!(
+            "unsupported operating system `{os}`; supported platforms are macOS and Linux"
+        ))
+    })
+}
+
+fn render_completions(
+    runtime: ContainerRuntime,
+    command: CompletionsCommand,
+) -> Result<String, OrodruinError> {
+    let mut cli = Cli::command_for_runtime(runtime);
     let mut output = Vec::new();
     let name = cli.get_name().to_string();
     generate(command.shell, &mut cli, name, &mut output);
     String::from_utf8(output).map_err(|error| OrodruinError::Message(error.to_string()))
 }
 
-fn resource_passthrough(resource: &str, command: ResourceCommands) -> PassthroughInvocation {
+fn resource_passthrough(
+    runtime: ContainerRuntime,
+    resource: &str,
+    command: ResourceCommands,
+) -> PassthroughInvocation {
+    let list = match (runtime, resource) {
+        (ContainerRuntime::AppleContainer, _) => "list",
+        (ContainerRuntime::Podman, "volume") => "ls",
+        (ContainerRuntime::Podman, "network") => "ls",
+        (ContainerRuntime::Podman, _) => "list",
+    };
+    let remove = match runtime {
+        ContainerRuntime::AppleContainer => "delete",
+        ContainerRuntime::Podman => "rm",
+    };
+
     match command {
         ResourceCommands::List(args) => {
-            passthrough_owned(format!("list {resource}s"), vec![resource, "list"], args)
+            passthrough_owned(format!("list {resource}s"), vec![resource, list], args)
         }
         ResourceCommands::Create(args) => {
             passthrough_owned(format!("create {resource}"), vec![resource, "create"], args)
@@ -246,7 +281,7 @@ fn resource_passthrough(resource: &str, command: ResourceCommands) -> Passthroug
             passthrough_owned(format!("prune {resource}s"), vec![resource, "prune"], args)
         }
         ResourceCommands::Remove(args) => {
-            passthrough_owned(format!("remove {resource}"), vec![resource, "delete"], args)
+            passthrough_owned(format!("remove {resource}"), vec![resource, remove], args)
         }
     }
 }
@@ -256,108 +291,398 @@ fn passthrough_owned(
     prefix: Vec<&str>,
     args: impl Into<Vec<String>>,
 ) -> PassthroughInvocation {
-    PassthroughInvocation {
-        step,
-        prefix: prefix.into_iter().map(str::to_string).collect(),
-        args: args.into(),
+    passthrough_with_args(step, prefix, args)
+}
+
+fn pull_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer => passthrough_with_args("pull image", vec!["image", "pull"], args),
+        ContainerRuntime::Podman => passthrough_with_args("pull image", vec!["pull"], args),
     }
 }
 
-fn image_passthrough(command: ImageCommands) -> PassthroughInvocation {
-    match command {
-        ImageCommands::Pull(args) => passthrough("pull image", &["image", "pull"], args),
-        ImageCommands::List(args) => passthrough("list images", &["image", "list"], args),
-        ImageCommands::Inspect(args) => passthrough("inspect image", &["image", "inspect"], args),
-        ImageCommands::Load(args) => passthrough("load image", &["image", "load"], args),
-        ImageCommands::Remove(args) => passthrough("remove image", &["image", "delete"], args),
-        ImageCommands::Push(args) => passthrough("push image", &["image", "push"], args),
-        ImageCommands::Prune(args) => passthrough("prune images", &["image", "prune"], args),
-        ImageCommands::Save(args) => passthrough("save image", &["image", "save"], args),
-        ImageCommands::Tag(args) => passthrough("tag image", &["image", "tag"], args),
+fn images_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer => passthrough_with_args("list images", vec!["image", "list"], args),
+        ContainerRuntime::Podman => passthrough_with_args("list images", vec!["images"], args),
     }
 }
 
-fn container_passthrough(command: ContainerCommands) -> PassthroughInvocation {
-    match command {
-        ContainerCommands::Create(args) => passthrough("create container", &["create"], args),
-        ContainerCommands::Exec(args) => passthrough("exec container command", &["exec"], args),
-        ContainerCommands::Export(args) => passthrough("export container", &["export"], args),
-        ContainerCommands::Kill(args) => passthrough("kill container", &["kill"], args),
-        ContainerCommands::List(args) => passthrough("list containers", &["list"], args),
-        ContainerCommands::Inspect(args) => passthrough("inspect container", &["inspect"], args),
-        ContainerCommands::Logs(args) => passthrough("show container logs", &["logs"], args),
-        ContainerCommands::Prune(args) => passthrough("prune containers", &["prune"], args),
-        ContainerCommands::Remove(args) => passthrough("remove container", &["delete"], args),
-        ContainerCommands::Run(args) => passthrough("run container", &["run"], args),
-        ContainerCommands::Start(args) => passthrough("start container", &["start"], args),
-        ContainerCommands::Stats(args) => passthrough("container stats", &["stats"], args),
-        ContainerCommands::Stop(args) => passthrough("stop container", &["stop"], args),
+fn rmi_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer => passthrough_with_args("remove image", vec!["image", "delete"], args),
+        ContainerRuntime::Podman => passthrough_with_args("remove image", vec!["rmi"], args),
     }
 }
 
-fn registry_passthrough(command: RegistryCommands) -> PassthroughInvocation {
-    match command {
-        RegistryCommands::List(args) => passthrough("list registries", &["registry", "list"], args),
-        RegistryCommands::Login(args) => {
-            passthrough("login registry", &["registry", "login"], args)
-        }
-        RegistryCommands::Logout(args) => {
-            passthrough("logout registry", &["registry", "logout"], args)
+fn ps_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer => passthrough_with_args("list containers", vec!["list"], args),
+        ContainerRuntime::Podman => passthrough_with_args("list containers", vec!["ps"], args),
+    }
+}
+
+fn logs_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer | ContainerRuntime::Podman => {
+            passthrough_with_args("show container logs", vec!["logs"], args)
         }
     }
 }
 
-fn builder_passthrough(command: BuilderCommands) -> PassthroughInvocation {
-    match command {
-        BuilderCommands::Remove(args) => {
-            passthrough("remove builder", &["builder", "delete"], args)
-        }
-        BuilderCommands::Start(args) => passthrough("start builder", &["builder", "start"], args),
-        BuilderCommands::Status(args) => {
-            passthrough("builder status", &["builder", "status"], args)
-        }
-        BuilderCommands::Stop(args) => passthrough("stop builder", &["builder", "stop"], args),
-    }
-}
-
-fn system_passthrough(command: SystemCommands) -> PassthroughInvocation {
-    match command {
-        SystemCommands::Df(args) => passthrough("system df", &["system", "df"], args),
-        SystemCommands::Dns(args) => passthrough("system dns", &["system", "dns"], args),
-        SystemCommands::Kernel(args) => passthrough("system kernel", &["system", "kernel"], args),
-        SystemCommands::Logs(args) => passthrough("system logs", &["system", "logs"], args),
-        SystemCommands::Property(args) => {
-            passthrough("system property", &["system", "property"], args)
-        }
-        SystemCommands::Start(args) => passthrough("start system", &["system", "start"], args),
-        SystemCommands::Status(args) => passthrough("system status", &["system", "status"], args),
-        SystemCommands::Stop(args) => passthrough("stop system", &["system", "stop"], args),
-        SystemCommands::Version(args) => {
-            passthrough("system version", &["system", "version"], args)
+fn build_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer | ContainerRuntime::Podman => {
+            passthrough_with_args("build image", vec!["build"], args)
         }
     }
 }
 
-fn machine_passthrough(command: MachineCommands) -> PassthroughInvocation {
-    match command {
-        MachineCommands::Create(args) => {
-            passthrough("create machine", &["machine", "create"], args)
-        }
-        MachineCommands::Inspect(args) => {
-            passthrough("inspect machine", &["machine", "inspect"], args)
-        }
-        MachineCommands::List(args) => passthrough("list machines", &["machine", "list"], args),
-        MachineCommands::Logs(args) => passthrough("machine logs", &["machine", "logs"], args),
-        MachineCommands::Remove(args) => {
-            passthrough("remove machine", &["machine", "delete"], args)
-        }
-        MachineCommands::Run(args) => passthrough("run machine command", &["machine", "run"], args),
-        MachineCommands::Set(args) => passthrough("set machine", &["machine", "set"], args),
-        MachineCommands::SetDefault(args) => {
-            passthrough("set default machine", &["machine", "set-default"], args)
-        }
-        MachineCommands::Stop(args) => passthrough("stop machine", &["machine", "stop"], args),
+fn copy_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer => passthrough_with_args("copy files", vec!["copy"], args),
+        ContainerRuntime::Podman => passthrough_with_args("copy files", vec!["cp"], args),
     }
+}
+
+fn login_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer => passthrough_with_args("login registry", vec!["registry", "login"], args),
+        ContainerRuntime::Podman => passthrough_with_args("login registry", vec!["login"], args),
+    }
+}
+
+fn logout_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+    match runtime {
+        ContainerRuntime::AppleContainer => passthrough_with_args("logout registry", vec!["registry", "logout"], args),
+        ContainerRuntime::Podman => passthrough_with_args("logout registry", vec!["logout"], args),
+    }
+}
+
+fn image_passthrough(
+    runtime: ContainerRuntime,
+    command: ImageCommands,
+) -> Result<PassthroughInvocation, OrodruinError> {
+    Ok(match (runtime, command) {
+        (ContainerRuntime::AppleContainer, ImageCommands::Pull(args)) => {
+            passthrough_with_args("pull image", vec!["image", "pull"], args)
+        }
+        (ContainerRuntime::Podman, ImageCommands::Pull(args)) => {
+            passthrough_with_args("pull image", vec!["image", "pull"], args)
+        }
+        (ContainerRuntime::AppleContainer, ImageCommands::List(args)) => {
+            passthrough_with_args("list images", vec!["image", "list"], args)
+        }
+        (ContainerRuntime::Podman, ImageCommands::List(args)) => {
+            passthrough_with_args("list images", vec!["image", "list"], args)
+        }
+        (_, ImageCommands::Inspect(args)) => {
+            passthrough_with_args("inspect image", vec!["image", "inspect"], args)
+        }
+        (_, ImageCommands::Load(args)) => {
+            passthrough_with_args("load image", vec!["image", "load"], args)
+        }
+        (ContainerRuntime::AppleContainer, ImageCommands::Remove(args)) => {
+            passthrough_with_args("remove image", vec!["image", "delete"], args)
+        }
+        (ContainerRuntime::Podman, ImageCommands::Remove(args)) => {
+            passthrough_with_args("remove image", vec!["image", "rm"], args)
+        }
+        (_, ImageCommands::Push(args)) => {
+            passthrough_with_args("push image", vec!["image", "push"], args)
+        }
+        (_, ImageCommands::Prune(args)) => {
+            passthrough_with_args("prune images", vec!["image", "prune"], args)
+        }
+        (_, ImageCommands::Save(args)) => {
+            passthrough_with_args("save image", vec!["image", "save"], args)
+        }
+        (_, ImageCommands::Tag(args)) => {
+            passthrough_with_args("tag image", vec!["image", "tag"], args)
+        }
+    })
+}
+
+fn container_passthrough(runtime: ContainerRuntime, command: ContainerCommands) -> PassthroughInvocation {
+    match (runtime, command) {
+        (ContainerRuntime::AppleContainer, ContainerCommands::Create(args)) => {
+            passthrough_with_args("create container", vec!["create"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Create(args)) => {
+            passthrough_with_args("create container", vec!["container", "create"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Exec(args)) => {
+            passthrough_with_args("exec container command", vec!["exec"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Exec(args)) => {
+            passthrough_with_args("exec container command", vec!["container", "exec"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Export(args)) => {
+            passthrough_with_args("export container", vec!["export"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Export(args)) => {
+            passthrough_with_args("export container", vec!["container", "export"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Kill(args)) => {
+            passthrough_with_args("kill container", vec!["kill"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Kill(args)) => {
+            passthrough_with_args("kill container", vec!["container", "kill"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::List(args)) => {
+            passthrough_with_args("list containers", vec!["list"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::List(args)) => {
+            passthrough_with_args("list containers", vec!["container", "ls"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Inspect(args)) => {
+            passthrough_with_args("inspect container", vec!["inspect"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Inspect(args)) => {
+            passthrough_with_args("inspect container", vec!["container", "inspect"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Logs(args)) => {
+            passthrough_with_args("show container logs", vec!["logs"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Logs(args)) => {
+            passthrough_with_args("show container logs", vec!["container", "logs"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Prune(args)) => {
+            passthrough_with_args("prune containers", vec!["prune"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Prune(args)) => {
+            passthrough_with_args("prune containers", vec!["container", "prune"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Remove(args)) => {
+            passthrough_with_args("remove container", vec!["delete"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Remove(args)) => {
+            passthrough_with_args("remove container", vec!["container", "rm"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Run(args)) => {
+            passthrough_with_args("run container", vec!["run"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Run(args)) => {
+            passthrough_with_args("run container", vec!["container", "run"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Start(args)) => {
+            passthrough_with_args("start container", vec!["start"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Start(args)) => {
+            passthrough_with_args("start container", vec!["container", "start"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Stats(args)) => {
+            passthrough_with_args("container stats", vec!["stats"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Stats(args)) => {
+            passthrough_with_args("container stats", vec!["container", "stats"], args)
+        }
+        (ContainerRuntime::AppleContainer, ContainerCommands::Stop(args)) => {
+            passthrough_with_args("stop container", vec!["stop"], args)
+        }
+        (ContainerRuntime::Podman, ContainerCommands::Stop(args)) => {
+            passthrough_with_args("stop container", vec!["container", "stop"], args)
+        }
+    }
+}
+
+fn registry_passthrough(
+    runtime: ContainerRuntime,
+    command: RegistryCommands,
+) -> Result<PassthroughInvocation, OrodruinError> {
+    match (runtime, command) {
+        (ContainerRuntime::AppleContainer, RegistryCommands::List(args)) => {
+            Ok(passthrough_with_args("list registries", vec!["registry", "list"], args))
+        }
+        (ContainerRuntime::Podman, RegistryCommands::List(_)) => Err(unsupported_with_podman(
+            "registry list",
+            "Podman does not provide an equivalent registry listing command",
+        )),
+        (ContainerRuntime::AppleContainer, RegistryCommands::Login(args)) => Ok(
+            passthrough_with_args("login registry", vec!["registry", "login"], args),
+        ),
+        (ContainerRuntime::Podman, RegistryCommands::Login(args)) => {
+            Ok(passthrough_with_args("login registry", vec!["login"], args))
+        }
+        (ContainerRuntime::AppleContainer, RegistryCommands::Logout(args)) => Ok(
+            passthrough_with_args("logout registry", vec!["registry", "logout"], args),
+        ),
+        (ContainerRuntime::Podman, RegistryCommands::Logout(args)) => {
+            Ok(passthrough_with_args("logout registry", vec!["logout"], args))
+        }
+    }
+}
+
+fn builder_passthrough(
+    runtime: ContainerRuntime,
+    command: BuilderCommands,
+) -> Result<PassthroughInvocation, OrodruinError> {
+    match runtime {
+        ContainerRuntime::AppleContainer => Ok(match command {
+            BuilderCommands::Remove(args) => {
+                passthrough_with_args("remove builder", vec!["builder", "delete"], args)
+            }
+            BuilderCommands::Start(args) => {
+                passthrough_with_args("start builder", vec!["builder", "start"], args)
+            }
+            BuilderCommands::Status(args) => {
+                passthrough_with_args("builder status", vec!["builder", "status"], args)
+            }
+            BuilderCommands::Stop(args) => {
+                passthrough_with_args("stop builder", vec!["builder", "stop"], args)
+            }
+        }),
+        ContainerRuntime::Podman => match command {
+            BuilderCommands::Remove(args) => Ok(passthrough_with_args(
+                "prune builder cache",
+                vec!["builder", "prune"],
+                args,
+            )),
+            BuilderCommands::Status(args) => Ok(passthrough_with_args(
+                "inspect builder capabilities",
+                vec!["builder", "inspect"],
+                args,
+            )),
+            BuilderCommands::Start(_) => Err(unsupported_with_podman(
+                "builder start",
+                "Podman buildx does not provide a start subcommand",
+            )),
+            BuilderCommands::Stop(_) => Err(unsupported_with_podman(
+                "builder stop",
+                "Podman buildx does not provide a stop subcommand",
+            )),
+        },
+    }
+}
+
+fn system_passthrough(
+    runtime: ContainerRuntime,
+    command: SystemCommands,
+) -> Result<PassthroughInvocation, OrodruinError> {
+    match runtime {
+        ContainerRuntime::AppleContainer => Ok(match command {
+            SystemCommands::Df(args) => passthrough_with_args("system df", vec!["system", "df"], args),
+            SystemCommands::Dns(args) => passthrough_with_args("system dns", vec!["system", "dns"], args),
+            SystemCommands::Kernel(args) => passthrough_with_args("system kernel", vec!["system", "kernel"], args),
+            SystemCommands::Logs(args) => passthrough_with_args("system logs", vec!["system", "logs"], args),
+            SystemCommands::Property(args) => {
+                passthrough_with_args("system property", vec!["system", "property"], args)
+            }
+            SystemCommands::Start(args) => passthrough_with_args("start system", vec!["system", "start"], args),
+            SystemCommands::Status(args) => passthrough_with_args("system status", vec!["system", "status"], args),
+            SystemCommands::Stop(args) => passthrough_with_args("stop system", vec!["system", "stop"], args),
+            SystemCommands::Version(args) => {
+                passthrough_with_args("system version", vec!["system", "version"], args)
+            }
+        }),
+        ContainerRuntime::Podman => match command {
+            SystemCommands::Df(args) => {
+                Ok(passthrough_with_args("system df", vec!["system", "df"], args))
+            }
+            SystemCommands::Logs(args) => Ok(passthrough_with_args(
+                "system events",
+                vec!["system", "events"],
+                args,
+            )),
+            SystemCommands::Status(args) => Ok(passthrough_with_args(
+                "system info",
+                vec!["system", "info"],
+                args,
+            )),
+            SystemCommands::Version(args) => {
+                Ok(passthrough_with_args("podman version", vec!["version"], args))
+            }
+            SystemCommands::Dns(_) => Err(unsupported_with_podman(
+                "system dns",
+                "Podman does not provide a system dns subcommand",
+            )),
+            SystemCommands::Kernel(_) => Err(unsupported_with_podman(
+                "system kernel",
+                "Podman does not provide a system kernel subcommand",
+            )),
+            SystemCommands::Property(_) => Err(unsupported_with_podman(
+                "system property",
+                "Podman does not provide a system property subcommand",
+            )),
+            SystemCommands::Start(_) => Err(unsupported_with_podman(
+                "system start",
+                "Podman does not provide a system start subcommand on Linux",
+            )),
+            SystemCommands::Stop(_) => Err(unsupported_with_podman(
+                "system stop",
+                "Podman does not provide a system stop subcommand on Linux",
+            )),
+        },
+    }
+}
+
+fn machine_passthrough(
+    runtime: ContainerRuntime,
+    command: MachineCommands,
+) -> Result<PassthroughInvocation, OrodruinError> {
+    match runtime {
+        ContainerRuntime::AppleContainer => Ok(match command {
+            MachineCommands::Create(args) => {
+                passthrough_with_args("create machine", vec!["machine", "create"], args)
+            }
+            MachineCommands::Inspect(args) => {
+                passthrough_with_args("inspect machine", vec!["machine", "inspect"], args)
+            }
+            MachineCommands::List(args) => passthrough_with_args("list machines", vec!["machine", "list"], args),
+            MachineCommands::Logs(args) => passthrough_with_args("machine logs", vec!["machine", "logs"], args),
+            MachineCommands::Remove(args) => {
+                passthrough_with_args("remove machine", vec!["machine", "delete"], args)
+            }
+            MachineCommands::Run(args) => passthrough_with_args("run machine command", vec!["machine", "run"], args),
+            MachineCommands::Set(args) => passthrough_with_args("set machine", vec!["machine", "set"], args),
+            MachineCommands::SetDefault(args) => {
+                passthrough_with_args("set default machine", vec!["machine", "set-default"], args)
+            }
+            MachineCommands::Stop(args) => passthrough_with_args("stop machine", vec!["machine", "stop"], args),
+        }),
+        ContainerRuntime::Podman => match command {
+            MachineCommands::Create(args) => {
+                Ok(passthrough_with_args("create machine", vec!["machine", "init"], args))
+            }
+            MachineCommands::Inspect(args) => Ok(passthrough_with_args(
+                "inspect machine",
+                vec!["machine", "inspect"],
+                args,
+            )),
+            MachineCommands::List(args) => {
+                Ok(passthrough_with_args("list machines", vec!["machine", "list"], args))
+            }
+            MachineCommands::Logs(args) => Ok(passthrough_with_args(
+                "show machine info",
+                vec!["machine", "info"],
+                args,
+            )),
+            MachineCommands::Remove(args) => {
+                Ok(passthrough_with_args("remove machine", vec!["machine", "rm"], args))
+            }
+            MachineCommands::Run(args) => Ok(passthrough_with_args(
+                "ssh into machine",
+                vec!["machine", "ssh"],
+                args,
+            )),
+            MachineCommands::Set(args) => {
+                Ok(passthrough_with_args("set machine", vec!["machine", "set"], args))
+            }
+            MachineCommands::SetDefault(_) => Err(unsupported_with_podman(
+                "machine set-default",
+                "Podman machine does not provide a set-default subcommand",
+            )),
+            MachineCommands::Stop(args) => {
+                Ok(passthrough_with_args("stop machine", vec!["machine", "stop"], args))
+            }
+        },
+    }
+}
+
+fn unsupported_with_podman(command: &str, reason: &str) -> OrodruinError {
+    OrodruinError::Message(format!(
+        "`{command}` is not supported with the Linux Podman backend: {reason}"
+    ))
 }
 
 impl From<OptionalPassthroughArgs> for Vec<String> {
@@ -592,14 +917,22 @@ fn materialize_environment(
     }
 }
 
-fn ensure_container_system_running(backend: &dyn ContainerBackend) -> Result<(), OrodruinError> {
-    ensure_container_system_running_with_prompt(backend, prompt_to_start_container_system)
+fn ensure_container_system_running(
+    backend: &dyn ContainerBackend,
+    runtime: ContainerRuntime,
+) -> Result<(), OrodruinError> {
+    ensure_container_system_running_with_prompt(backend, runtime, prompt_to_start_container_system)
 }
 
 fn ensure_container_system_running_with_prompt(
     backend: &dyn ContainerBackend,
+    runtime: ContainerRuntime,
     prompt: impl FnOnce() -> Result<bool, OrodruinError>,
 ) -> Result<(), OrodruinError> {
+    if !runtime.manages_system_lifecycle() {
+        return Ok(());
+    }
+
     if backend.system_running()? {
         return Ok(());
     }
@@ -1015,7 +1348,12 @@ mod tests {
             ..MockBackend::default()
         };
 
-        ensure_container_system_running_with_prompt(&backend, || Ok(true)).unwrap();
+        ensure_container_system_running_with_prompt(
+            &backend,
+            ContainerRuntime::AppleContainer,
+            || Ok(true),
+        )
+        .unwrap();
         assert_eq!(*backend.system_starts.borrow(), 1);
     }
 
@@ -1031,8 +1369,28 @@ mod tests {
         };
 
         let error =
-            ensure_container_system_running_with_prompt(&backend, || Ok(false)).unwrap_err();
+            ensure_container_system_running_with_prompt(
+                &backend,
+                ContainerRuntime::AppleContainer,
+                || Ok(false),
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("container system not running"));
+        assert_eq!(*backend.system_starts.borrow(), 0);
+    }
+
+    #[test]
+    fn podman_runtime_skips_container_system_prompt() {
+        let backend = MockBackend {
+            system_running_results: RefCell::new(VecDeque::from([Ok(false)])),
+            ..MockBackend::default()
+        };
+
+        ensure_container_system_running_with_prompt(&backend, ContainerRuntime::Podman, || {
+            panic!("podman should not prompt for a container system startup")
+        })
+        .unwrap();
+
         assert_eq!(*backend.system_starts.borrow(), 0);
     }
 
@@ -1571,6 +1929,125 @@ mod tests {
     }
 
     #[test]
+    fn podman_passthrough_commands_use_linux_cli_shape() {
+        let backend = MockBackend::default();
+
+        for command in [
+            Commands::Pull(RequiredPassthroughArgs {
+                args: vec!["alpine:latest".into()],
+            }),
+            Commands::Ps(OptionalPassthroughArgs {
+                args: vec!["--all".into()],
+            }),
+            Commands::Copy(RequiredPassthroughArgs {
+                args: vec!["host.txt".into(), "demo:/tmp/host.txt".into()],
+            }),
+            Commands::Volume(ResourceCommands::List(OptionalPassthroughArgs {
+                args: vec![],
+            })),
+            Commands::Network(ResourceCommands::Remove(RequiredPassthroughArgs {
+                args: vec!["demo-net".into()],
+            })),
+            Commands::Container(ContainerCommands::Remove(RequiredPassthroughArgs {
+                args: vec!["demo".into()],
+            })),
+            Commands::System(SystemCommands::Version(OptionalPassthroughArgs {
+                args: vec![],
+            })),
+            Commands::System(SystemCommands::Status(OptionalPassthroughArgs {
+                args: vec![],
+            })),
+            Commands::Machine(MachineCommands::Create(OptionalPassthroughArgs {
+                args: vec!["devvm".into()],
+            })),
+            Commands::Machine(MachineCommands::Run(OptionalPassthroughArgs {
+                args: vec!["devvm".into()],
+            })),
+            Commands::Builder(BuilderCommands::Status(OptionalPassthroughArgs {
+                args: vec![],
+            })),
+            Commands::Builder(BuilderCommands::Remove(OptionalPassthroughArgs {
+                args: vec!["--all".into()],
+            })),
+        ] {
+            run_with_backend_for_runtime(
+                Cli {
+                    debug: false,
+                    config: None,
+                    command,
+                },
+                &backend,
+                ContainerRuntime::Podman,
+            )
+            .unwrap();
+        }
+
+        let commands = backend.commands.borrow();
+        assert_eq!(commands[0].1.program, "podman");
+        assert_eq!(commands[0].1.args, ["pull", "alpine:latest"]);
+        assert_eq!(commands[1].1.args, ["ps", "--all"]);
+        assert_eq!(commands[2].1.args, ["cp", "host.txt", "demo:/tmp/host.txt"]);
+        assert_eq!(commands[3].1.args, ["volume", "ls"]);
+        assert_eq!(commands[4].1.args, ["network", "rm", "demo-net"]);
+        assert_eq!(commands[5].1.args, ["container", "rm", "demo"]);
+        assert_eq!(commands[6].1.args, ["version"]);
+        assert_eq!(commands[7].1.args, ["system", "info"]);
+        assert_eq!(commands[8].1.args, ["machine", "init", "devvm"]);
+        assert_eq!(commands[9].1.args, ["machine", "ssh", "devvm"]);
+        assert_eq!(commands[10].1.args, ["builder", "inspect"]);
+        assert_eq!(commands[11].1.args, ["builder", "prune", "--all"]);
+    }
+
+    #[test]
+    fn podman_rejects_unsupported_apple_only_passthroughs() {
+        let backend = MockBackend::default();
+        let system_error = run_with_backend_for_runtime(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::System(SystemCommands::Dns(OptionalPassthroughArgs {
+                    args: vec![],
+                })),
+            },
+            &backend,
+            ContainerRuntime::Podman,
+        )
+        .unwrap_err();
+
+        let registry_error = run_with_backend_for_runtime(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
+                    args: vec![],
+                })),
+            },
+            &backend,
+            ContainerRuntime::Podman,
+        )
+        .unwrap_err();
+
+        let machine_error = run_with_backend_for_runtime(
+            Cli {
+                debug: false,
+                config: None,
+                command: Commands::Machine(MachineCommands::SetDefault(
+                    OptionalPassthroughArgs {
+                        args: vec!["devvm".into()],
+                    },
+                )),
+            },
+            &backend,
+            ContainerRuntime::Podman,
+        )
+        .unwrap_err();
+
+        assert!(system_error.to_string().contains("system dns"));
+        assert!(registry_error.to_string().contains("registry list"));
+        assert!(machine_error.to_string().contains("machine set-default"));
+    }
+
+    #[test]
     fn enter_uses_project_default_env_when_omitted() {
         let tempdir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1753,14 +2230,32 @@ mod tests {
 
     #[test]
     fn completions_render_current_subcommands() {
-        let output = render_completions(CompletionsCommand {
-            shell: clap_complete::Shell::Bash,
-        })
+        let output = render_completions(
+            ContainerRuntime::AppleContainer,
+            CompletionsCommand {
+                shell: clap_complete::Shell::Bash,
+            },
+        )
         .unwrap();
 
         assert!(output.contains("completions"));
         assert!(output.contains("orodruin"));
         assert!(output.contains("inspect"));
         assert!(output.contains("ssh"));
+    }
+
+    #[test]
+    fn podman_completions_omit_pruned_subcommands() {
+        let output = render_completions(
+            ContainerRuntime::Podman,
+            CompletionsCommand {
+                shell: clap_complete::Shell::Bash,
+            },
+        )
+        .unwrap();
+
+        assert!(output.contains("version"));
+        assert!(!output.contains("set-default"));
+        assert!(!output.contains(" dns "));
     }
 }

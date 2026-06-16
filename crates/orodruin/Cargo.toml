@@ -1,10 +1,10 @@
 [package]
-name = "orodruin"
+name = "orodruin-cli"
 version = "0.1.2"
 authors = ["Edward Fitz Abucay <gh:@ffimnsr>"]
 edition = "2024"
 readme = "README.md"
-description = "Toolbox-style Apple container wrapper for project development environments"
+description = "Toolbox-style Apple container wrapper / Linux podman wrapper for project development environments"
 categories = ["command-line-utilities", "development-tools"]
 homepage = "https://github.com/ffimnsr/orodruin-rs"
 repository = "https://github.com/ffimnsr/orodruin-rs"

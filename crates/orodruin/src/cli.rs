@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::Shell;
+
+use crate::backend::ContainerRuntime;
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -17,6 +19,77 @@ pub struct Cli {
     pub config: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Commands,
+}
+
+impl Cli {
+    pub fn parse_for_runtime<I, T>(args: I, runtime: ContainerRuntime) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = Self::command_for_runtime(runtime).try_get_matches_from(args)?;
+        Self::from_arg_matches(&matches)
+    }
+
+    pub fn command_for_runtime(runtime: ContainerRuntime) -> Command {
+        prune_command_for_runtime(Self::command(), runtime, &[])
+    }
+}
+
+fn prune_command_for_runtime(
+    command: Command,
+    runtime: ContainerRuntime,
+    parent_path: &[String],
+) -> Command {
+    let name = command.get_name().to_string();
+    let mut path = parent_path.to_vec();
+    path.push(name);
+
+    if !command_path_supported(runtime, &path) {
+        return hide_command_path(command, &path);
+    }
+
+    command.mut_subcommands(|child| prune_command_for_runtime(child, runtime, &path))
+}
+
+fn command_path_supported(runtime: ContainerRuntime, path: &[String]) -> bool {
+    if runtime == ContainerRuntime::AppleContainer {
+        return true;
+    }
+
+    let path = path.iter().map(String::as_str).collect::<Vec<_>>();
+    !matches!(
+        path.as_slice(),
+        ["orodruin", "registry", "list"]
+            | ["orodruin", "builder", "start"]
+            | ["orodruin", "builder", "stop"]
+            | ["orodruin", "system", "dns"]
+            | ["orodruin", "system", "kernel"]
+            | ["orodruin", "system", "property"]
+            | ["orodruin", "system", "start"]
+            | ["orodruin", "system", "stop"]
+            | ["orodruin", "machine", "set-default"]
+    )
+}
+
+fn hide_command_path(command: Command, path: &[String]) -> Command {
+    let hidden_name = match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["orodruin", "registry", "list"] => "__hidden__registry__list",
+        ["orodruin", "builder", "start"] => "__hidden__builder__start",
+        ["orodruin", "builder", "stop"] => "__hidden__builder__stop",
+        ["orodruin", "system", "dns"] => "__hidden__system__dns",
+        ["orodruin", "system", "kernel"] => "__hidden__system__kernel",
+        ["orodruin", "system", "property"] => "__hidden__system__property",
+        ["orodruin", "system", "start"] => "__hidden__system__start",
+        ["orodruin", "system", "stop"] => "__hidden__system__stop",
+        ["orodruin", "machine", "set-default"] => "__hidden__machine__set_default",
+        _ => "__hidden__unsupported",
+    };
+    command
+        .name(hidden_name)
+        .aliases(Vec::<&str>::new())
+        .visible_aliases(Vec::<&str>::new())
+        .hide(true)
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -37,39 +110,39 @@ pub enum Commands {
     Rm(EnvironmentName),
     #[command(about = "Show the resolved configuration and container details for an environment")]
     Inspect(EnvironmentName),
-    #[command(about = "Pull an image with Apple container")]
+    #[command(about = "Pull an image with the configured container runtime")]
     Pull(RequiredPassthroughArgs),
-    #[command(about = "List local images with Apple container")]
+    #[command(about = "List local images with the configured container runtime")]
     Images(OptionalPassthroughArgs),
-    #[command(about = "Remove an image with Apple container")]
+    #[command(about = "Remove an image with the configured container runtime")]
     Rmi(RequiredPassthroughArgs),
-    #[command(about = "List containers with Apple container")]
+    #[command(about = "List containers with the configured container runtime")]
     Ps(OptionalPassthroughArgs),
-    #[command(about = "Show container logs with Apple container")]
+    #[command(about = "Show container logs with the configured container runtime")]
     Logs(OptionalPassthroughArgs),
-    #[command(about = "Build an image with Apple container")]
+    #[command(about = "Build an image with the configured container runtime")]
     Build(RequiredPassthroughArgs),
-    #[command(about = "Copy files with Apple container", visible_alias = "cp")]
+    #[command(about = "Copy files with the configured container runtime", visible_alias = "cp")]
     Copy(RequiredPassthroughArgs),
-    #[command(about = "Log in to a registry with Apple container")]
+    #[command(about = "Log in to a registry with the configured container runtime")]
     Login(OptionalPassthroughArgs),
-    #[command(about = "Log out from a registry with Apple container")]
+    #[command(about = "Log out from a registry with the configured container runtime")]
     Logout(OptionalPassthroughArgs),
-    #[command(subcommand, about = "Run Apple container image commands")]
+    #[command(subcommand, about = "Run image commands with the configured container runtime")]
     Image(ImageCommands),
-    #[command(subcommand, about = "Run Apple container container commands")]
+    #[command(subcommand, about = "Run container commands with the configured container runtime")]
     Container(ContainerCommands),
-    #[command(subcommand, about = "Run Apple container registry commands")]
+    #[command(subcommand, about = "Run registry commands with the configured container runtime")]
     Registry(RegistryCommands),
-    #[command(subcommand, about = "Run Apple container volume commands")]
+    #[command(subcommand, about = "Run volume commands with the configured container runtime")]
     Volume(ResourceCommands),
-    #[command(subcommand, about = "Run Apple container network commands")]
+    #[command(subcommand, about = "Run network commands with the configured container runtime")]
     Network(ResourceCommands),
-    #[command(subcommand, about = "Run Apple container builder commands")]
+    #[command(subcommand, about = "Run builder commands with the configured container runtime")]
     Builder(BuilderCommands),
-    #[command(subcommand, about = "Run Apple container system commands")]
+    #[command(subcommand, about = "Run system commands with the configured container runtime")]
     System(SystemCommands),
-    #[command(subcommand, about = "Run Apple container machine commands")]
+    #[command(subcommand, about = "Run machine commands with the configured container runtime")]
     Machine(MachineCommands),
     #[command(about = "Generate shell completion scripts")]
     Completions(CompletionsCommand),
@@ -432,5 +505,42 @@ mod tests {
                 print: false,
             })
         );
+    }
+
+    #[test]
+    fn podman_runtime_prunes_unsupported_subcommands() {
+        let command = Cli::command_for_runtime(ContainerRuntime::Podman);
+        let registry = command.find_subcommand("registry").unwrap();
+        let builder = command.find_subcommand("builder").unwrap();
+        let system = command.find_subcommand("system").unwrap();
+        let machine = command.find_subcommand("machine").unwrap();
+
+        assert!(registry.find_subcommand("list").is_none());
+        assert!(registry.find_subcommand("login").is_some());
+        assert!(builder.find_subcommand("start").is_none());
+        assert!(builder.find_subcommand("status").is_some());
+        assert!(system.find_subcommand("dns").is_none());
+        assert!(system.find_subcommand("version").is_some());
+        assert!(machine.find_subcommand("set-default").is_none());
+        assert!(machine.find_subcommand("set").is_some());
+    }
+
+    #[test]
+    fn podman_runtime_rejects_pruned_subcommands() {
+        let error = Cli::parse_for_runtime(
+            ["orodruin", "system", "dns"],
+            ContainerRuntime::Podman,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+
+        let error = Cli::parse_for_runtime(
+            ["orodruin", "registry", "list"],
+            ContainerRuntime::Podman,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 }
