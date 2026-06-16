@@ -1,9 +1,18 @@
 [package]
 name = "orodruin"
 version = "0.1.1"
+authors = ["Edward Fitz Abucay <gh:@ffimnsr>"]
 edition = "2024"
+readme = "README.md"
 description = "Toolbox-style Apple container wrapper for project development environments"
-license = "MIT"
+categories = ["command-line-utilities", "development-tools"]
+homepage = "https://github.com/ffimnsr/orodruin-rs"
+repository = "https://github.com/ffimnsr/orodruin-rs"
+license = "MIT OR Apache-2.0"
+keywords = ["command-line", "task-runner", "cli", "runner", "utility"]
+exclude = [
+  ".gitignore"
+]
 
 [dependencies]
 clap = { version = "4.5.8", features = ["derive"] }
