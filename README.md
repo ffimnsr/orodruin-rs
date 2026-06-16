@@ -31,7 +31,8 @@ If you want to install the binary from this repository, use Cargo directly:
 cargo install --path crates/orodruin
 ```
 
-That installs `orodruin` into Cargo's binary directory, usually `~/.cargo/bin`.
+That installs the CLI binaries into Cargo's binary directory, usually `~/.cargo/bin`.
+The primary command is `orodruin`; `rui` is provided as a shorter alias.
 
 ## Build From Source
 
@@ -43,7 +44,7 @@ cd orodruin-rs
 cargo build --release -p orodruin
 ```
 
-The compiled binary will be available at `target/release/orodruin`.
+The compiled binaries will be available at `target/release/orodruin` and `target/release/rui`.
 
 Run the library tests while you are here:
 

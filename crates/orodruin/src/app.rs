@@ -33,8 +33,15 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    let args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+    let program_name = args
+        .first()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("orodruin")
+        .to_string();
     let runtime = runtime_for_os(std::env::consts::OS)?;
-    let cli = Cli::parse_for_runtime(args, runtime).unwrap_or_else(|error| error.exit());
+    let cli = Cli::parse_for_runtime_named(args, runtime, &program_name).unwrap_or_else(|error| error.exit());
     let backend = ContainerCliBackend::new(cli.debug, runtime);
     run_with_backend_for_runtime(cli, &backend, runtime)
 }

@@ -27,12 +27,33 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let matches = Self::command_for_runtime(runtime).try_get_matches_from(args)?;
+        Self::parse_for_runtime_named(args, runtime, "orodruin")
+    }
+
+    pub fn parse_for_runtime_named<I, T>(
+        args: I,
+        runtime: ContainerRuntime,
+        program_name: &str,
+    ) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = Self::command_for_runtime_named(runtime, program_name).try_get_matches_from(args)?;
         Self::from_arg_matches(&matches)
     }
 
     pub fn command_for_runtime(runtime: ContainerRuntime) -> Command {
-        prune_command_for_runtime(Self::command(), runtime, &[])
+        Self::command_for_runtime_named(runtime, "orodruin")
+    }
+
+    pub fn command_for_runtime_named(runtime: ContainerRuntime, program_name: &str) -> Command {
+        prune_command_for_runtime(
+            Self::command().bin_name(program_name.to_string()),
+            runtime,
+            &[],
+            "orodruin",
+        )
     }
 }
 
@@ -40,56 +61,85 @@ fn prune_command_for_runtime(
     command: Command,
     runtime: ContainerRuntime,
     parent_path: &[String],
+    root_name: &str,
 ) -> Command {
     let name = command.get_name().to_string();
     let mut path = parent_path.to_vec();
     path.push(name);
 
-    if !command_path_supported(runtime, &path) {
-        return hide_command_path(command, &path);
+    if !command_path_supported(runtime, &path, root_name) {
+        return hide_command_path(command, &path, root_name);
     }
 
-    command.mut_subcommands(|child| prune_command_for_runtime(child, runtime, &path))
+    command.mut_subcommands(|child| prune_command_for_runtime(child, runtime, &path, root_name))
 }
 
-fn command_path_supported(runtime: ContainerRuntime, path: &[String]) -> bool {
+fn command_path_supported(runtime: ContainerRuntime, path: &[String], root_name: &str) -> bool {
     if runtime == ContainerRuntime::AppleContainer {
         return true;
     }
 
     let path = path.iter().map(String::as_str).collect::<Vec<_>>();
-    !matches!(
-        path.as_slice(),
-        ["orodruin", "registry", "list"]
-            | ["orodruin", "builder", "start"]
-            | ["orodruin", "builder", "stop"]
-            | ["orodruin", "system", "dns"]
-            | ["orodruin", "system", "kernel"]
-            | ["orodruin", "system", "property"]
-            | ["orodruin", "system", "start"]
-            | ["orodruin", "system", "stop"]
-            | ["orodruin", "machine", "set-default"]
-    )
+    !is_hidden_path(path.as_slice(), root_name)
 }
 
-fn hide_command_path(command: Command, path: &[String]) -> Command {
-    let hidden_name = match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["orodruin", "registry", "list"] => "__hidden__registry__list",
-        ["orodruin", "builder", "start"] => "__hidden__builder__start",
-        ["orodruin", "builder", "stop"] => "__hidden__builder__stop",
-        ["orodruin", "system", "dns"] => "__hidden__system__dns",
-        ["orodruin", "system", "kernel"] => "__hidden__system__kernel",
-        ["orodruin", "system", "property"] => "__hidden__system__property",
-        ["orodruin", "system", "start"] => "__hidden__system__start",
-        ["orodruin", "system", "stop"] => "__hidden__system__stop",
-        ["orodruin", "machine", "set-default"] => "__hidden__machine__set_default",
-        _ => "__hidden__unsupported",
+fn hide_command_path(command: Command, path: &[String], root_name: &str) -> Command {
+    let hidden_name = if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "registry", "list"]
+    {
+        "__hidden__registry__list"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "builder", "start"]
+    {
+        "__hidden__builder__start"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "builder", "stop"]
+    {
+        "__hidden__builder__stop"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "system", "dns"]
+    {
+        "__hidden__system__dns"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "system", "kernel"]
+    {
+        "__hidden__system__kernel"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "system", "property"]
+    {
+        "__hidden__system__property"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "system", "start"]
+    {
+        "__hidden__system__start"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "system", "stop"]
+    {
+        "__hidden__system__stop"
+    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+        == [root_name, "machine", "set-default"]
+    {
+        "__hidden__machine__set_default"
+    } else {
+        "__hidden__unsupported"
     };
     command
         .name(hidden_name)
         .aliases(Vec::<&str>::new())
         .visible_aliases(Vec::<&str>::new())
         .hide(true)
+}
+
+fn is_hidden_path(path: &[&str], root_name: &str) -> bool {
+    path == [root_name, "registry", "list"]
+        || path == [root_name, "builder", "start"]
+        || path == [root_name, "builder", "stop"]
+        || path == [root_name, "system", "dns"]
+        || path == [root_name, "system", "kernel"]
+        || path == [root_name, "system", "property"]
+        || path == [root_name, "system", "start"]
+        || path == [root_name, "system", "stop"]
+        || path == [root_name, "machine", "set-default"]
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -523,6 +573,13 @@ mod tests {
         assert!(system.find_subcommand("version").is_some());
         assert!(machine.find_subcommand("set-default").is_none());
         assert!(machine.find_subcommand("set").is_some());
+    }
+
+    #[test]
+    fn command_for_runtime_named_uses_the_requested_binary_name() {
+        let command = Cli::command_for_runtime_named(ContainerRuntime::Podman, "rui");
+
+        assert_eq!(command.get_bin_name(), Some("rui"));
     }
 
     #[test]
