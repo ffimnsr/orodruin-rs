@@ -1,6 +1,6 @@
 [package]
 name = "orodruin"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Edward Fitz Abucay <gh:@ffimnsr>"]
 edition = "2024"
 readme = "README.md"

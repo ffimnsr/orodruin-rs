@@ -349,8 +349,14 @@ mod tests {
 
         assert_eq!(config.project.name.as_deref(), Some("demo \"quoted\""));
         let env = config.envs.get("dev").unwrap();
-        assert_eq!(env.project_mount.as_deref(), Some("/workspace/demo \"quoted\""));
+        assert_eq!(
+            env.project_mount.as_deref(),
+            Some("/workspace/demo \"quoted\"")
+        );
         assert_eq!(env.workdir.as_deref(), Some("/workspace/demo \"quoted\""));
-        assert_eq!(env.shell.as_deref(), Some([String::from("/bin/bash")].as_slice()));
+        assert_eq!(
+            env.shell.as_deref(),
+            Some([String::from("/bin/bash")].as_slice())
+        );
     }
 }

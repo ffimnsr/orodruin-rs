@@ -39,6 +39,8 @@ pub struct ExecRequest {
 pub trait ContainerBackend {
     fn list_all(&self) -> Result<Vec<ContainerSummary>, BackendError>;
     fn inspect_raw(&self, container_name: &str) -> Result<Option<Value>, BackendError>;
+    fn system_running(&self) -> Result<bool, BackendError>;
+    fn start_system(&self) -> Result<(), BackendError>;
     fn build_image(&self, build: &ResolvedBuild) -> Result<(), BackendError>;
     fn create(&self, environment: &ResolvedEnvironment) -> Result<(), BackendError>;
     fn start(&self, container_name: &str) -> Result<(), BackendError>;
@@ -72,6 +74,25 @@ impl AppleContainerBackend {
         CommandSpec {
             program: "container".into(),
             args: vec!["inspect".into(), container_name.into()],
+        }
+    }
+
+    pub fn build_system_status_spec() -> CommandSpec {
+        CommandSpec {
+            program: "container".into(),
+            args: vec![
+                "system".into(),
+                "status".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+        }
+    }
+
+    pub fn build_system_start_spec() -> CommandSpec {
+        CommandSpec {
+            program: "container".into(),
+            args: vec!["system".into(), "start".into()],
         }
     }
 
@@ -217,6 +238,18 @@ impl ContainerBackend for AppleContainerBackend {
         Ok(parse_inspect_output(&output))
     }
 
+    fn system_running(&self) -> Result<bool, BackendError> {
+        match self.run_captured("check system status", &Self::build_system_status_spec()) {
+            Ok(output) => Ok(system_status_reports_running(&output)),
+            Err(BackendError::CommandFailed { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn start_system(&self) -> Result<(), BackendError> {
+        self.run_interactive("start system", &Self::build_system_start_spec())
+    }
+
     fn build_image(&self, build: &ResolvedBuild) -> Result<(), BackendError> {
         self.run_interactive("build image", &Self::build_build_spec(build))
     }
@@ -321,6 +354,30 @@ fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn system_status_reports_running(output: &str) -> bool {
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .is_some_and(|value| value_contains_apiserver(&value))
+}
+
+fn value_contains_apiserver(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.iter().any(|(key, candidate)| {
+                matches!(key.as_str(), "appName" | "component" | "name")
+                    && candidate.as_str() == Some("container-apiserver")
+            }) {
+                return true;
+            }
+
+            map.values().any(value_contains_apiserver)
+        }
+        Value::Array(values) => values.iter().any(value_contains_apiserver),
+        Value::String(candidate) => candidate == "container-apiserver",
+        _ => false,
+    }
 }
 
 #[cfg(test)]

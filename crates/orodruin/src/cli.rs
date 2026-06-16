@@ -91,13 +91,17 @@ pub struct EnvironmentName {
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
 pub struct EnterCommand {
-    #[arg(help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment")]
+    #[arg(
+        help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment"
+    )]
     pub env: Option<String>,
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
 pub struct SshCommand {
-    #[arg(help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment")]
+    #[arg(
+        help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment"
+    )]
     pub env: Option<String>,
     #[arg(long, action = ArgAction::SetTrue, help = "Print the ssh command instead of executing it")]
     pub print: bool,
@@ -180,7 +184,11 @@ pub enum ContainerCommands {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum RegistryCommands {
-    #[command(name = "list", about = "List configured registries", visible_alias = "ls")]
+    #[command(
+        name = "list",
+        about = "List configured registries",
+        visible_alias = "ls"
+    )]
     List(OptionalPassthroughArgs),
     #[command(about = "Log in to a registry")]
     Login(OptionalPassthroughArgs),
@@ -246,7 +254,11 @@ pub enum MachineCommands {
     List(OptionalPassthroughArgs),
     #[command(about = "Show machine logs")]
     Logs(OptionalPassthroughArgs),
-    #[command(name = "remove", about = "Remove a container machine", visible_alias = "rm")]
+    #[command(
+        name = "remove",
+        about = "Remove a container machine",
+        visible_alias = "rm"
+    )]
     Remove(OptionalPassthroughArgs),
     #[command(about = "Run a command in a container machine")]
     Run(OptionalPassthroughArgs),
@@ -273,7 +285,9 @@ mod tests {
         let cli = Cli::parse_from(["orodruin", "image", "ls"]);
         assert_eq!(
             cli.command,
-            Commands::Image(ImageCommands::List(OptionalPassthroughArgs { args: vec![] }))
+            Commands::Image(ImageCommands::List(OptionalPassthroughArgs {
+                args: vec![]
+            }))
         );
 
         let cli = Cli::parse_from(["orodruin", "rmi", "alpine:latest"]);
@@ -314,7 +328,9 @@ mod tests {
         let cli = Cli::parse_from(["orodruin", "registry", "ls"]);
         assert_eq!(
             cli.command,
-            Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs { args: vec![] }))
+            Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
+                args: vec![]
+            }))
         );
 
         let cli = Cli::parse_from(["orodruin", "volume", "c", "cache"]);
@@ -352,19 +368,25 @@ mod tests {
         let cli = Cli::parse_from(["orodruin", "machine", "ls"]);
         assert_eq!(
             cli.command,
-            Commands::Machine(MachineCommands::List(OptionalPassthroughArgs { args: vec![] }))
+            Commands::Machine(MachineCommands::List(OptionalPassthroughArgs {
+                args: vec![]
+            }))
         );
 
         let cli = Cli::parse_from(["orodruin", "builder", "rm"]);
         assert_eq!(
             cli.command,
-            Commands::Builder(BuilderCommands::Remove(OptionalPassthroughArgs { args: vec![] }))
+            Commands::Builder(BuilderCommands::Remove(OptionalPassthroughArgs {
+                args: vec![]
+            }))
         );
 
         let cli = Cli::parse_from(["orodruin", "system", "version"]);
         assert_eq!(
             cli.command,
-            Commands::System(SystemCommands::Version(OptionalPassthroughArgs { args: vec![] }))
+            Commands::System(SystemCommands::Version(OptionalPassthroughArgs {
+                args: vec![]
+            }))
         );
     }
 

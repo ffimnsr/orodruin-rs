@@ -9,7 +9,10 @@ pub enum OrodruinError {
     #[error("{0}")]
     Message(String),
     #[error("`{command}` failed with exit status {status:?}")]
-    CommandFailed { command: String, status: Option<i32> },
+    CommandFailed {
+        command: String,
+        status: Option<i32>,
+    },
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]

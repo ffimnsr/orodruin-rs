@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
     fs,
+    io::{self, BufRead, Write},
     net::IpAddr,
     path::Path,
     process::{Command as ProcessCommand, Stdio},
@@ -15,8 +16,7 @@ use crate::{
     cli::{
         BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, EnvironmentName,
         ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
-        RequiredPassthroughArgs, ResourceCommands, RunCommand,
-        SystemCommands,
+        RequiredPassthroughArgs, ResourceCommands, RunCommand, SystemCommands,
     },
     config::{CONFIG_FILE_NAME, LoadedConfig, ProjectConfig, default_init_config},
     env_model::ResolvedEnvironment,
@@ -51,7 +51,9 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
         }
         Commands::Enter(environment) => {
             let loaded = load_config(cli.config.as_deref())?;
-            let resolved = resolve_optional_environment(&loaded, environment.env.as_deref(), "enter")?;
+            let resolved =
+                resolve_optional_environment(&loaded, environment.env.as_deref(), "enter")?;
+            ensure_container_system_running(backend)?;
             materialize_environment(backend, &resolved)?;
             ensure_container_user(backend, &resolved)?;
             match backend.exec(
@@ -146,20 +148,46 @@ fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), Orod
                 None => println!("container not created"),
             }
         }
-        Commands::Pull(args) => run_passthrough(backend, passthrough("pull image", &["image", "pull"], args))?,
-        Commands::Images(args) => run_passthrough(backend, passthrough("list images", &["image", "list"], args))?,
-        Commands::Rmi(args) => run_passthrough(backend, passthrough("remove image", &["image", "delete"], args))?,
-        Commands::Ps(args) => run_passthrough(backend, passthrough("list containers", &["list"], args))?,
-        Commands::Logs(args) => run_passthrough(backend, passthrough("show container logs", &["logs"], args))?,
-        Commands::Build(args) => run_passthrough(backend, passthrough("build image", &["build"], args))?,
-        Commands::Copy(args) => run_passthrough(backend, passthrough("copy files", &["copy"], args))?,
-        Commands::Login(args) => run_passthrough(backend, passthrough("login registry", &["registry", "login"], args))?,
-        Commands::Logout(args) => run_passthrough(backend, passthrough("logout registry", &["registry", "logout"], args))?,
+        Commands::Pull(args) => {
+            run_passthrough(backend, passthrough("pull image", &["image", "pull"], args))?
+        }
+        Commands::Images(args) => run_passthrough(
+            backend,
+            passthrough("list images", &["image", "list"], args),
+        )?,
+        Commands::Rmi(args) => run_passthrough(
+            backend,
+            passthrough("remove image", &["image", "delete"], args),
+        )?,
+        Commands::Ps(args) => {
+            run_passthrough(backend, passthrough("list containers", &["list"], args))?
+        }
+        Commands::Logs(args) => {
+            run_passthrough(backend, passthrough("show container logs", &["logs"], args))?
+        }
+        Commands::Build(args) => {
+            run_passthrough(backend, passthrough("build image", &["build"], args))?
+        }
+        Commands::Copy(args) => {
+            run_passthrough(backend, passthrough("copy files", &["copy"], args))?
+        }
+        Commands::Login(args) => run_passthrough(
+            backend,
+            passthrough("login registry", &["registry", "login"], args),
+        )?,
+        Commands::Logout(args) => run_passthrough(
+            backend,
+            passthrough("logout registry", &["registry", "logout"], args),
+        )?,
         Commands::Image(command) => run_passthrough(backend, image_passthrough(command))?,
         Commands::Container(command) => run_passthrough(backend, container_passthrough(command))?,
         Commands::Registry(command) => run_passthrough(backend, registry_passthrough(command))?,
-        Commands::Volume(command) => run_passthrough(backend, resource_passthrough("volume", command))?,
-        Commands::Network(command) => run_passthrough(backend, resource_passthrough("network", command))?,
+        Commands::Volume(command) => {
+            run_passthrough(backend, resource_passthrough("volume", command))?
+        }
+        Commands::Network(command) => {
+            run_passthrough(backend, resource_passthrough("network", command))?
+        }
         Commands::Builder(command) => run_passthrough(backend, builder_passthrough(command))?,
         Commands::System(command) => run_passthrough(backend, system_passthrough(command))?,
         Commands::Machine(command) => run_passthrough(backend, machine_passthrough(command))?,
@@ -201,16 +229,25 @@ fn render_completions(command: CompletionsCommand) -> Result<String, OrodruinErr
     String::from_utf8(output).map_err(|error| OrodruinError::Message(error.to_string()))
 }
 
-fn resource_passthrough(
-    resource: &str,
-    command: ResourceCommands,
-) -> PassthroughInvocation {
+fn resource_passthrough(resource: &str, command: ResourceCommands) -> PassthroughInvocation {
     match command {
-        ResourceCommands::List(args) => passthrough_owned(format!("list {resource}s"), vec![resource, "list"], args),
-        ResourceCommands::Create(args) => passthrough_owned(format!("create {resource}"), vec![resource, "create"], args),
-        ResourceCommands::Inspect(args) => passthrough_owned(format!("inspect {resource}"), vec![resource, "inspect"], args),
-        ResourceCommands::Prune(args) => passthrough_owned(format!("prune {resource}s"), vec![resource, "prune"], args),
-        ResourceCommands::Remove(args) => passthrough_owned(format!("remove {resource}"), vec![resource, "delete"], args),
+        ResourceCommands::List(args) => {
+            passthrough_owned(format!("list {resource}s"), vec![resource, "list"], args)
+        }
+        ResourceCommands::Create(args) => {
+            passthrough_owned(format!("create {resource}"), vec![resource, "create"], args)
+        }
+        ResourceCommands::Inspect(args) => passthrough_owned(
+            format!("inspect {resource}"),
+            vec![resource, "inspect"],
+            args,
+        ),
+        ResourceCommands::Prune(args) => {
+            passthrough_owned(format!("prune {resource}s"), vec![resource, "prune"], args)
+        }
+        ResourceCommands::Remove(args) => {
+            passthrough_owned(format!("remove {resource}"), vec![resource, "delete"], args)
+        }
     }
 }
 
@@ -261,16 +298,24 @@ fn container_passthrough(command: ContainerCommands) -> PassthroughInvocation {
 fn registry_passthrough(command: RegistryCommands) -> PassthroughInvocation {
     match command {
         RegistryCommands::List(args) => passthrough("list registries", &["registry", "list"], args),
-        RegistryCommands::Login(args) => passthrough("login registry", &["registry", "login"], args),
-        RegistryCommands::Logout(args) => passthrough("logout registry", &["registry", "logout"], args),
+        RegistryCommands::Login(args) => {
+            passthrough("login registry", &["registry", "login"], args)
+        }
+        RegistryCommands::Logout(args) => {
+            passthrough("logout registry", &["registry", "logout"], args)
+        }
     }
 }
 
 fn builder_passthrough(command: BuilderCommands) -> PassthroughInvocation {
     match command {
-        BuilderCommands::Remove(args) => passthrough("remove builder", &["builder", "delete"], args),
+        BuilderCommands::Remove(args) => {
+            passthrough("remove builder", &["builder", "delete"], args)
+        }
         BuilderCommands::Start(args) => passthrough("start builder", &["builder", "start"], args),
-        BuilderCommands::Status(args) => passthrough("builder status", &["builder", "status"], args),
+        BuilderCommands::Status(args) => {
+            passthrough("builder status", &["builder", "status"], args)
+        }
         BuilderCommands::Stop(args) => passthrough("stop builder", &["builder", "stop"], args),
     }
 }
@@ -281,24 +326,36 @@ fn system_passthrough(command: SystemCommands) -> PassthroughInvocation {
         SystemCommands::Dns(args) => passthrough("system dns", &["system", "dns"], args),
         SystemCommands::Kernel(args) => passthrough("system kernel", &["system", "kernel"], args),
         SystemCommands::Logs(args) => passthrough("system logs", &["system", "logs"], args),
-        SystemCommands::Property(args) => passthrough("system property", &["system", "property"], args),
+        SystemCommands::Property(args) => {
+            passthrough("system property", &["system", "property"], args)
+        }
         SystemCommands::Start(args) => passthrough("start system", &["system", "start"], args),
         SystemCommands::Status(args) => passthrough("system status", &["system", "status"], args),
         SystemCommands::Stop(args) => passthrough("stop system", &["system", "stop"], args),
-        SystemCommands::Version(args) => passthrough("system version", &["system", "version"], args),
+        SystemCommands::Version(args) => {
+            passthrough("system version", &["system", "version"], args)
+        }
     }
 }
 
 fn machine_passthrough(command: MachineCommands) -> PassthroughInvocation {
     match command {
-        MachineCommands::Create(args) => passthrough("create machine", &["machine", "create"], args),
-        MachineCommands::Inspect(args) => passthrough("inspect machine", &["machine", "inspect"], args),
+        MachineCommands::Create(args) => {
+            passthrough("create machine", &["machine", "create"], args)
+        }
+        MachineCommands::Inspect(args) => {
+            passthrough("inspect machine", &["machine", "inspect"], args)
+        }
         MachineCommands::List(args) => passthrough("list machines", &["machine", "list"], args),
         MachineCommands::Logs(args) => passthrough("machine logs", &["machine", "logs"], args),
-        MachineCommands::Remove(args) => passthrough("remove machine", &["machine", "delete"], args),
+        MachineCommands::Remove(args) => {
+            passthrough("remove machine", &["machine", "delete"], args)
+        }
         MachineCommands::Run(args) => passthrough("run machine command", &["machine", "run"], args),
         MachineCommands::Set(args) => passthrough("set machine", &["machine", "set"], args),
-        MachineCommands::SetDefault(args) => passthrough("set default machine", &["machine", "set-default"], args),
+        MachineCommands::SetDefault(args) => {
+            passthrough("set default machine", &["machine", "set-default"], args)
+        }
         MachineCommands::Stop(args) => passthrough("stop machine", &["machine", "stop"], args),
     }
 }
@@ -445,15 +502,18 @@ fn ssh_host_from_inspect(value: &Value) -> Option<String> {
         .and_then(|status| status.get("networks"))
         .and_then(Value::as_array)
         .and_then(|networks| {
-            networks
-                .iter()
-                .find_map(|network| find_ip_field(network, &["ipv4Address", "ipAddress", "address"]))
+            networks.iter().find_map(|network| {
+                find_ip_field(network, &["ipv4Address", "ipAddress", "address"])
+            })
         })
     {
         return Some(host);
     }
 
-    find_ip_field(value, &["ipv4Address", "ipAddress", "ip_address", "IPAddress", "ip"])
+    find_ip_field(
+        value,
+        &["ipv4Address", "ipAddress", "ip_address", "IPAddress", "ip"],
+    )
 }
 
 fn find_ip_field(value: &Value, field_names: &[&str]) -> Option<String> {
@@ -528,6 +588,66 @@ fn materialize_environment(
             }
             backend.create(resolved)?;
             Ok(())
+        }
+    }
+}
+
+fn ensure_container_system_running(backend: &dyn ContainerBackend) -> Result<(), OrodruinError> {
+    ensure_container_system_running_with_prompt(backend, prompt_to_start_container_system)
+}
+
+fn ensure_container_system_running_with_prompt(
+    backend: &dyn ContainerBackend,
+    prompt: impl FnOnce() -> Result<bool, OrodruinError>,
+) -> Result<(), OrodruinError> {
+    if backend.system_running()? {
+        return Ok(());
+    }
+
+    if prompt()? {
+        backend.start_system()?;
+        return Ok(());
+    }
+
+    Err(OrodruinError::Message(
+        "container system not running; start it first with `container system start`".into(),
+    ))
+}
+
+fn prompt_to_start_container_system() -> Result<bool, OrodruinError> {
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
+    prompt_to_start_container_system_with_io(&mut stdin, &mut stderr)
+}
+
+fn prompt_to_start_container_system_with_io<R, W>(
+    stdin: &mut R,
+    stderr: &mut W,
+) -> Result<bool, OrodruinError>
+where
+    R: BufRead,
+    W: Write,
+{
+    loop {
+        write!(
+            stderr,
+            "container system is not running. Start it now? [y/N] "
+        )?;
+        stderr.flush()?;
+
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            return Ok(false);
+        }
+
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" | "" => return Ok(false),
+            _ => {
+                writeln!(stderr, "please answer y or n")?;
+            }
         }
     }
 }
@@ -685,8 +805,10 @@ mod tests {
         list_results: RefCell<VecDeque<Vec<ContainerSummary>>>,
         inspect_value: RefCell<Option<serde_json::Value>>,
         inspect_calls: RefCell<Vec<String>>,
+        system_running_results: RefCell<VecDeque<Result<bool, BackendError>>>,
         created: RefCell<Vec<String>>,
         started: RefCell<Vec<String>>,
+        system_starts: RefCell<usize>,
         deleted: RefCell<Vec<String>>,
         execs: RefCell<Vec<ExecRequest>>,
         exec_results: RefCell<VecDeque<Result<(), BackendError>>>,
@@ -747,6 +869,18 @@ mod tests {
                 .borrow_mut()
                 .push(container_name.to_string());
             Ok(self.inspect_value.borrow().clone())
+        }
+
+        fn system_running(&self) -> Result<bool, BackendError> {
+            self.system_running_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(true))
+        }
+
+        fn start_system(&self) -> Result<(), BackendError> {
+            *self.system_starts.borrow_mut() += 1;
+            Ok(())
         }
 
         fn build_image(&self, build: &ResolvedBuild) -> Result<(), BackendError> {
@@ -868,6 +1002,56 @@ mod tests {
             backend.execs.borrow()[1].user.as_ref().map(|user| user.uid),
             Some(unsafe { libc::getuid() })
         );
+    }
+
+    #[test]
+    fn enter_prompts_before_starting_container_system() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend {
+            system_running_results: RefCell::new(VecDeque::from([Ok(false)])),
+            ..MockBackend::default()
+        };
+
+        ensure_container_system_running_with_prompt(&backend, || Ok(true)).unwrap();
+        assert_eq!(*backend.system_starts.borrow(), 1);
+    }
+
+    #[test]
+    fn enter_aborts_when_container_system_prompt_declined() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend {
+            system_running_results: RefCell::new(VecDeque::from([Ok(false)])),
+            ..MockBackend::default()
+        };
+
+        let error =
+            ensure_container_system_running_with_prompt(&backend, || Ok(false)).unwrap_err();
+        assert!(error.to_string().contains("container system not running"));
+        assert_eq!(*backend.system_starts.borrow(), 0);
+    }
+
+    #[test]
+    fn prompt_accepts_yes_and_no() {
+        let mut stdin = std::io::Cursor::new(b"maybe\ny\n");
+        let mut stderr = Vec::new();
+        let accepted = prompt_to_start_container_system_with_io(&mut stdin, &mut stderr).unwrap();
+        assert!(accepted);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("please answer y or n")
+        );
+
+        let mut stdin = std::io::Cursor::new(b"n\n");
+        let mut stderr = Vec::new();
+        let declined = prompt_to_start_container_system_with_io(&mut stdin, &mut stderr).unwrap();
+        assert!(!declined);
     }
 
     #[test]
@@ -1065,7 +1249,11 @@ mod tests {
         let execs = backend.execs.borrow();
         assert_eq!(execs[0].command[0], "/bin/sh");
         assert!(execs[0].command[2].contains("useradd -K UID_MIN=0 -K UID_MAX=60000"));
-        assert!(execs[0].command[2].contains("useradd -m -d \"$home\" -u \"$uid\" -g \"$gid\" -s /bin/sh \"$username\""));
+        assert!(
+            execs[0].command[2].contains(
+                "useradd -m -d \"$home\" -u \"$uid\" -g \"$gid\" -s /bin/sh \"$username\""
+            )
+        );
         assert_eq!(execs[0].user, None);
         assert_eq!(
             execs[1].env.iter().find(|(key, _)| key == "HOME"),
@@ -1201,7 +1389,10 @@ mod tests {
         let commands = backend.commands.borrow();
         assert_eq!(commands[0].1.args, ["image", "inspect", "alpine:latest"]);
         assert_eq!(commands[1].1.args, ["image", "push", "demo:latest"]);
-        assert_eq!(commands[2].1.args, ["image", "tag", "demo:latest", "demo:v1"]);
+        assert_eq!(
+            commands[2].1.args,
+            ["image", "tag", "demo:latest", "demo:v1"]
+        );
     }
 
     #[test]
@@ -1234,7 +1425,10 @@ mod tests {
 
         let commands = backend.commands.borrow();
         assert_eq!(commands[0].1.args, ["image", "load", "-i", "image.tar"]);
-        assert_eq!(commands[1].1.args, ["image", "save", "-o", "image.tar", "demo:latest"]);
+        assert_eq!(
+            commands[1].1.args,
+            ["image", "save", "-o", "image.tar", "demo:latest"]
+        );
     }
 
     #[test]
@@ -1245,11 +1439,9 @@ mod tests {
             Cli {
                 debug: false,
                 config: None,
-                command: Commands::Container(ContainerCommands::Inspect(
-                    RequiredPassthroughArgs {
-                        args: vec!["demo".into()],
-                    },
-                )),
+                command: Commands::Container(ContainerCommands::Inspect(RequiredPassthroughArgs {
+                    args: vec!["demo".into()],
+                })),
             },
             &backend,
         )
@@ -1259,11 +1451,9 @@ mod tests {
             Cli {
                 debug: false,
                 config: None,
-                command: Commands::Container(ContainerCommands::Start(
-                    RequiredPassthroughArgs {
-                        args: vec!["demo".into()],
-                    },
-                )),
+                command: Commands::Container(ContainerCommands::Start(RequiredPassthroughArgs {
+                    args: vec!["demo".into()],
+                })),
             },
             &backend,
         )
@@ -1273,11 +1463,9 @@ mod tests {
             Cli {
                 debug: false,
                 config: None,
-                command: Commands::Container(ContainerCommands::Stop(
-                    RequiredPassthroughArgs {
-                        args: vec!["demo".into()],
-                    },
-                )),
+                command: Commands::Container(ContainerCommands::Stop(RequiredPassthroughArgs {
+                    args: vec!["demo".into()],
+                })),
             },
             &backend,
         )
@@ -1287,9 +1475,9 @@ mod tests {
             Cli {
                 debug: false,
                 config: None,
-                command: Commands::Container(ContainerCommands::Prune(
-                    OptionalPassthroughArgs { args: vec![] },
-                )),
+                command: Commands::Container(ContainerCommands::Prune(OptionalPassthroughArgs {
+                    args: vec![],
+                })),
             },
             &backend,
         )
@@ -1351,9 +1539,15 @@ mod tests {
         let backend = MockBackend::default();
 
         for command in [
-            Commands::Builder(BuilderCommands::Status(OptionalPassthroughArgs { args: vec![] })),
-            Commands::System(SystemCommands::Version(OptionalPassthroughArgs { args: vec![] })),
-            Commands::Machine(MachineCommands::List(OptionalPassthroughArgs { args: vec![] })),
+            Commands::Builder(BuilderCommands::Status(OptionalPassthroughArgs {
+                args: vec![],
+            })),
+            Commands::System(SystemCommands::Version(OptionalPassthroughArgs {
+                args: vec![],
+            })),
+            Commands::Machine(MachineCommands::List(OptionalPassthroughArgs {
+                args: vec![],
+            })),
             Commands::Machine(MachineCommands::SetDefault(OptionalPassthroughArgs {
                 args: vec!["desktop".into()],
             })),
@@ -1511,7 +1705,11 @@ mod tests {
         };
 
         let error = run_with_backend(cli, &backend).unwrap_err();
-        assert!(error.to_string().contains("`orodruin ssh` needs an environment name"));
+        assert!(
+            error
+                .to_string()
+                .contains("`orodruin ssh` needs an environment name")
+        );
     }
 
     #[test]
@@ -1546,7 +1744,11 @@ mod tests {
         };
 
         let error = run_with_backend(cli, &backend).unwrap_err();
-        assert!(error.to_string().contains("could not determine an ssh host"));
+        assert!(
+            error
+                .to_string()
+                .contains("could not determine an ssh host")
+        );
     }
 
     #[test]
