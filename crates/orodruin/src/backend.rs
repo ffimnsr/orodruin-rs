@@ -99,7 +99,12 @@ impl ContainerCliBackend {
             },
             ContainerRuntime::Podman => CommandSpec {
                 program: runtime.program().into(),
-                args: vec!["ps".into(), "--all".into(), "--format".into(), "json".into()],
+                args: vec![
+                    "ps".into(),
+                    "--all".into(),
+                    "--format".into(),
+                    "json".into(),
+                ],
             },
         }
     }
@@ -155,8 +160,12 @@ impl ContainerCliBackend {
             "--workdir".into(),
             environment.workdir.clone(),
         ];
+        if matches!(runtime, ContainerRuntime::Podman) {
+            args.push("--userns".into());
+            args.push("keep-id".into());
+        }
         append_env_args(&mut args, environment.env.iter());
-        append_mount_args(&mut args, &environment.mounts);
+        append_mount_args(&mut args, runtime, &environment.mounts);
         args.push(environment.image.clone());
         args.extend(environment.startup_command.iter().cloned());
         CommandSpec {
@@ -388,7 +397,7 @@ fn append_env_args<'a>(
     }
 }
 
-fn append_mount_args(args: &mut Vec<String>, mounts: &[ResolvedMount]) {
+fn append_mount_args(args: &mut Vec<String>, runtime: ContainerRuntime, mounts: &[ResolvedMount]) {
     for mount in mounts {
         args.push("--mount".into());
         let mut value = format!(
@@ -396,6 +405,9 @@ fn append_mount_args(args: &mut Vec<String>, mounts: &[ResolvedMount]) {
             mount.source.display(),
             mount.target
         );
+        if matches!(runtime, ContainerRuntime::Podman) {
+            value.push_str(",relabel=shared");
+        }
         if mount.readonly {
             value.push_str(",readonly");
         }
@@ -488,7 +500,8 @@ mod tests {
     #[test]
     fn create_emits_expected_container_command() {
         let environment = sample_environment();
-        let spec = ContainerCliBackend::build_create_spec(ContainerRuntime::AppleContainer, &environment);
+        let spec =
+            ContainerCliBackend::build_create_spec(ContainerRuntime::AppleContainer, &environment);
 
         assert_eq!(spec.program, "container");
         assert_eq!(spec.args[0], "run");
@@ -546,11 +559,8 @@ mod tests {
     fn passthrough_spec_uses_container_binary() {
         let spec = ContainerCliBackend::build_passthrough_spec(
             ContainerRuntime::AppleContainer,
-            vec![
-            "image".into(),
-            "pull".into(),
-            "alpine:latest".into(),
-        ]);
+            vec!["image".into(), "pull".into(), "alpine:latest".into()],
+        );
 
         assert_eq!(spec.program, "container");
         assert_eq!(spec.args, ["image", "pull", "alpine:latest"]);
@@ -559,12 +569,20 @@ mod tests {
     #[test]
     fn podman_specs_use_linux_command_shape() {
         let list_spec = ContainerCliBackend::build_list_spec(ContainerRuntime::Podman);
-        let delete_spec =
-            ContainerCliBackend::build_delete_spec(ContainerRuntime::Podman, "demo");
+        let delete_spec = ContainerCliBackend::build_delete_spec(ContainerRuntime::Podman, "demo");
+        let create_spec =
+            ContainerCliBackend::build_create_spec(ContainerRuntime::Podman, &sample_environment());
 
         assert_eq!(list_spec.program, "podman");
         assert_eq!(list_spec.args, ["ps", "--all", "--format", "json"]);
         assert_eq!(delete_spec.program, "podman");
         assert_eq!(delete_spec.args, ["rm", "--force", "demo"]);
+        assert!(create_spec.args.windows(2).any(|window| window == ["--userns", "keep-id"]));
+        assert!(create_spec.args.contains(
+            &"type=bind,source=/tmp/app,target=/workspace/app,relabel=shared".to_string()
+        ));
+        assert!(create_spec.args.contains(
+            &"type=bind,source=/tmp/cache,target=/cache,relabel=shared,readonly".to_string()
+        ));
     }
 }

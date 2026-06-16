@@ -39,7 +39,8 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let matches = Self::command_for_runtime_named(runtime, program_name).try_get_matches_from(args)?;
+        let matches =
+            Self::command_for_runtime_named(runtime, program_name).try_get_matches_from(args)?;
         Self::from_arg_matches(&matches)
     }
 
@@ -84,39 +85,75 @@ fn command_path_supported(runtime: ContainerRuntime, path: &[String], root_name:
 }
 
 fn hide_command_path(command: Command, path: &[String], root_name: &str) -> Command {
-    let hidden_name = if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    let hidden_name = if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "registry", "list"]
     {
         "__hidden__registry__list"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "builder", "start"]
     {
         "__hidden__builder__start"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "builder", "stop"]
     {
         "__hidden__builder__stop"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "system", "dns"]
     {
         "__hidden__system__dns"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "system", "kernel"]
     {
         "__hidden__system__kernel"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "system", "property"]
     {
         "__hidden__system__property"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "system", "start"]
     {
         "__hidden__system__start"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "system", "stop"]
     {
         "__hidden__system__stop"
-    } else if path.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+    } else if path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
         == [root_name, "machine", "set-default"]
     {
         "__hidden__machine__set_default"
@@ -172,27 +209,54 @@ pub enum Commands {
     Logs(OptionalPassthroughArgs),
     #[command(about = "Build an image with the configured container runtime")]
     Build(RequiredPassthroughArgs),
-    #[command(about = "Copy files with the configured container runtime", visible_alias = "cp")]
+    #[command(
+        about = "Copy files with the configured container runtime",
+        visible_alias = "cp"
+    )]
     Copy(RequiredPassthroughArgs),
     #[command(about = "Log in to a registry with the configured container runtime")]
     Login(OptionalPassthroughArgs),
     #[command(about = "Log out from a registry with the configured container runtime")]
     Logout(OptionalPassthroughArgs),
-    #[command(subcommand, about = "Run image commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run image commands with the configured container runtime"
+    )]
     Image(ImageCommands),
-    #[command(subcommand, about = "Run container commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run container commands with the configured container runtime"
+    )]
     Container(ContainerCommands),
-    #[command(subcommand, about = "Run registry commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run registry commands with the configured container runtime"
+    )]
     Registry(RegistryCommands),
-    #[command(subcommand, about = "Run volume commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run volume commands with the configured container runtime"
+    )]
     Volume(ResourceCommands),
-    #[command(subcommand, about = "Run network commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run network commands with the configured container runtime"
+    )]
     Network(ResourceCommands),
-    #[command(subcommand, about = "Run builder commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run builder commands with the configured container runtime"
+    )]
     Builder(BuilderCommands),
-    #[command(subcommand, about = "Run system commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run system commands with the configured container runtime"
+    )]
     System(SystemCommands),
-    #[command(subcommand, about = "Run machine commands with the configured container runtime")]
+    #[command(
+        subcommand,
+        about = "Run machine commands with the configured container runtime"
+    )]
     Machine(MachineCommands),
     #[command(about = "Generate shell completion scripts")]
     Completions(CompletionsCommand),
@@ -584,19 +648,14 @@ mod tests {
 
     #[test]
     fn podman_runtime_rejects_pruned_subcommands() {
-        let error = Cli::parse_for_runtime(
-            ["orodruin", "system", "dns"],
-            ContainerRuntime::Podman,
-        )
-        .unwrap_err();
+        let error = Cli::parse_for_runtime(["orodruin", "system", "dns"], ContainerRuntime::Podman)
+            .unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
 
-        let error = Cli::parse_for_runtime(
-            ["orodruin", "registry", "list"],
-            ContainerRuntime::Podman,
-        )
-        .unwrap_err();
+        let error =
+            Cli::parse_for_runtime(["orodruin", "registry", "list"], ContainerRuntime::Podman)
+                .unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }

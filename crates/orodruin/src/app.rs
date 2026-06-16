@@ -11,14 +11,17 @@ use clap_complete::generate;
 use serde_json::{Value, to_string_pretty};
 
 use crate::{
-    backend::{BackendError, CommandSpec, ContainerBackend, ContainerCliBackend, ContainerRuntime, ExecRequest},
+    backend::{
+        BackendError, CommandSpec, ContainerBackend, ContainerCliBackend, ContainerRuntime,
+        ExecRequest,
+    },
     cli::{
         BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, EnvironmentName,
         ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
         RequiredPassthroughArgs, ResourceCommands, RunCommand, SystemCommands,
     },
     config::{CONFIG_FILE_NAME, LoadedConfig, ProjectConfig, default_init_config},
-    env_model::ResolvedEnvironment,
+    env_model::{ResolvedEnvironment, ResolvedUser},
     error::OrodruinError,
     state::ContainerSummary,
 };
@@ -41,7 +44,8 @@ where
         .unwrap_or("orodruin")
         .to_string();
     let runtime = runtime_for_os(std::env::consts::OS)?;
-    let cli = Cli::parse_for_runtime_named(args, runtime, &program_name).unwrap_or_else(|error| error.exit());
+    let cli = Cli::parse_for_runtime_named(args, runtime, &program_name)
+        .unwrap_or_else(|error| error.exit());
     let backend = ContainerCliBackend::new(cli.debug, runtime);
     run_with_backend_for_runtime(cli, &backend, runtime)
 }
@@ -163,38 +167,42 @@ fn run_with_backend_for_runtime(
                 None => println!("container not created"),
             }
         }
-        Commands::Pull(args) => {
-            run_passthrough(backend, runtime, pull_passthrough(runtime, args))?
+        Commands::Pull(args) => run_passthrough(backend, runtime, pull_passthrough(runtime, args))?,
+        Commands::Images(args) => {
+            run_passthrough(backend, runtime, images_passthrough(runtime, args))?
         }
-        Commands::Images(args) => run_passthrough(backend, runtime, images_passthrough(runtime, args))?,
         Commands::Rmi(args) => run_passthrough(backend, runtime, rmi_passthrough(runtime, args))?,
-        Commands::Ps(args) => {
-            run_passthrough(backend, runtime, ps_passthrough(runtime, args))?
-        }
-        Commands::Logs(args) => {
-            run_passthrough(backend, runtime, logs_passthrough(runtime, args))?
-        }
+        Commands::Ps(args) => run_passthrough(backend, runtime, ps_passthrough(runtime, args))?,
+        Commands::Logs(args) => run_passthrough(backend, runtime, logs_passthrough(runtime, args))?,
         Commands::Build(args) => {
             run_passthrough(backend, runtime, build_passthrough(runtime, args))?
         }
-        Commands::Copy(args) => {
-            run_passthrough(backend, runtime, copy_passthrough(runtime, args))?
+        Commands::Copy(args) => run_passthrough(backend, runtime, copy_passthrough(runtime, args))?,
+        Commands::Login(args) => {
+            run_passthrough(backend, runtime, login_passthrough(runtime, args))?
         }
-        Commands::Login(args) => run_passthrough(backend, runtime, login_passthrough(runtime, args))?,
-        Commands::Logout(args) => run_passthrough(backend, runtime, logout_passthrough(runtime, args))?,
-        Commands::Image(command) => run_passthrough(backend, runtime, image_passthrough(runtime, command)?)?,
+        Commands::Logout(args) => {
+            run_passthrough(backend, runtime, logout_passthrough(runtime, args))?
+        }
+        Commands::Image(command) => {
+            run_passthrough(backend, runtime, image_passthrough(runtime, command)?)?
+        }
         Commands::Container(command) => {
             run_passthrough(backend, runtime, container_passthrough(runtime, command))?
         }
         Commands::Registry(command) => {
             run_passthrough(backend, runtime, registry_passthrough(runtime, command)?)?
         }
-        Commands::Volume(command) => {
-            run_passthrough(backend, runtime, resource_passthrough(runtime, "volume", command))?
-        }
-        Commands::Network(command) => {
-            run_passthrough(backend, runtime, resource_passthrough(runtime, "network", command))?
-        }
+        Commands::Volume(command) => run_passthrough(
+            backend,
+            runtime,
+            resource_passthrough(runtime, "volume", command),
+        )?,
+        Commands::Network(command) => run_passthrough(
+            backend,
+            runtime,
+            resource_passthrough(runtime, "network", command),
+        )?,
         Commands::Builder(command) => {
             run_passthrough(backend, runtime, builder_passthrough(runtime, command)?)?
         }
@@ -302,35 +310,58 @@ fn passthrough_owned(
     passthrough_with_args(step, prefix, args)
 }
 
-fn pull_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+fn pull_passthrough(
+    runtime: ContainerRuntime,
+    args: RequiredPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
-        ContainerRuntime::AppleContainer => passthrough_with_args("pull image", vec!["image", "pull"], args),
+        ContainerRuntime::AppleContainer => {
+            passthrough_with_args("pull image", vec!["image", "pull"], args)
+        }
         ContainerRuntime::Podman => passthrough_with_args("pull image", vec!["pull"], args),
     }
 }
 
-fn images_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+fn images_passthrough(
+    runtime: ContainerRuntime,
+    args: OptionalPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
-        ContainerRuntime::AppleContainer => passthrough_with_args("list images", vec!["image", "list"], args),
+        ContainerRuntime::AppleContainer => {
+            passthrough_with_args("list images", vec!["image", "list"], args)
+        }
         ContainerRuntime::Podman => passthrough_with_args("list images", vec!["images"], args),
     }
 }
 
-fn rmi_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+fn rmi_passthrough(
+    runtime: ContainerRuntime,
+    args: RequiredPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
-        ContainerRuntime::AppleContainer => passthrough_with_args("remove image", vec!["image", "delete"], args),
+        ContainerRuntime::AppleContainer => {
+            passthrough_with_args("remove image", vec!["image", "delete"], args)
+        }
         ContainerRuntime::Podman => passthrough_with_args("remove image", vec!["rmi"], args),
     }
 }
 
-fn ps_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+fn ps_passthrough(
+    runtime: ContainerRuntime,
+    args: OptionalPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
-        ContainerRuntime::AppleContainer => passthrough_with_args("list containers", vec!["list"], args),
+        ContainerRuntime::AppleContainer => {
+            passthrough_with_args("list containers", vec!["list"], args)
+        }
         ContainerRuntime::Podman => passthrough_with_args("list containers", vec!["ps"], args),
     }
 }
 
-fn logs_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+fn logs_passthrough(
+    runtime: ContainerRuntime,
+    args: OptionalPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
         ContainerRuntime::AppleContainer | ContainerRuntime::Podman => {
             passthrough_with_args("show container logs", vec!["logs"], args)
@@ -338,7 +369,10 @@ fn logs_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) ->
     }
 }
 
-fn build_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+fn build_passthrough(
+    runtime: ContainerRuntime,
+    args: RequiredPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
         ContainerRuntime::AppleContainer | ContainerRuntime::Podman => {
             passthrough_with_args("build image", vec!["build"], args)
@@ -346,23 +380,36 @@ fn build_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -
     }
 }
 
-fn copy_passthrough(runtime: ContainerRuntime, args: RequiredPassthroughArgs) -> PassthroughInvocation {
+fn copy_passthrough(
+    runtime: ContainerRuntime,
+    args: RequiredPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
         ContainerRuntime::AppleContainer => passthrough_with_args("copy files", vec!["copy"], args),
         ContainerRuntime::Podman => passthrough_with_args("copy files", vec!["cp"], args),
     }
 }
 
-fn login_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+fn login_passthrough(
+    runtime: ContainerRuntime,
+    args: OptionalPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
-        ContainerRuntime::AppleContainer => passthrough_with_args("login registry", vec!["registry", "login"], args),
+        ContainerRuntime::AppleContainer => {
+            passthrough_with_args("login registry", vec!["registry", "login"], args)
+        }
         ContainerRuntime::Podman => passthrough_with_args("login registry", vec!["login"], args),
     }
 }
 
-fn logout_passthrough(runtime: ContainerRuntime, args: OptionalPassthroughArgs) -> PassthroughInvocation {
+fn logout_passthrough(
+    runtime: ContainerRuntime,
+    args: OptionalPassthroughArgs,
+) -> PassthroughInvocation {
     match runtime {
-        ContainerRuntime::AppleContainer => passthrough_with_args("logout registry", vec!["registry", "logout"], args),
+        ContainerRuntime::AppleContainer => {
+            passthrough_with_args("logout registry", vec!["registry", "logout"], args)
+        }
         ContainerRuntime::Podman => passthrough_with_args("logout registry", vec!["logout"], args),
     }
 }
@@ -411,7 +458,10 @@ fn image_passthrough(
     })
 }
 
-fn container_passthrough(runtime: ContainerRuntime, command: ContainerCommands) -> PassthroughInvocation {
+fn container_passthrough(
+    runtime: ContainerRuntime,
+    command: ContainerCommands,
+) -> PassthroughInvocation {
     match (runtime, command) {
         (ContainerRuntime::AppleContainer, ContainerCommands::Create(args)) => {
             passthrough_with_args("create container", vec!["create"], args)
@@ -499,9 +549,9 @@ fn registry_passthrough(
     command: RegistryCommands,
 ) -> Result<PassthroughInvocation, OrodruinError> {
     match (runtime, command) {
-        (ContainerRuntime::AppleContainer, RegistryCommands::List(args)) => {
-            Ok(passthrough_with_args("list registries", vec!["registry", "list"], args))
-        }
+        (ContainerRuntime::AppleContainer, RegistryCommands::List(args)) => Ok(
+            passthrough_with_args("list registries", vec!["registry", "list"], args),
+        ),
         (ContainerRuntime::Podman, RegistryCommands::List(_)) => Err(unsupported_with_podman(
             "registry list",
             "Podman does not provide an equivalent registry listing command",
@@ -515,9 +565,11 @@ fn registry_passthrough(
         (ContainerRuntime::AppleContainer, RegistryCommands::Logout(args)) => Ok(
             passthrough_with_args("logout registry", vec!["registry", "logout"], args),
         ),
-        (ContainerRuntime::Podman, RegistryCommands::Logout(args)) => {
-            Ok(passthrough_with_args("logout registry", vec!["logout"], args))
-        }
+        (ContainerRuntime::Podman, RegistryCommands::Logout(args)) => Ok(passthrough_with_args(
+            "logout registry",
+            vec!["logout"],
+            args,
+        )),
     }
 }
 
@@ -569,24 +621,40 @@ fn system_passthrough(
 ) -> Result<PassthroughInvocation, OrodruinError> {
     match runtime {
         ContainerRuntime::AppleContainer => Ok(match command {
-            SystemCommands::Df(args) => passthrough_with_args("system df", vec!["system", "df"], args),
-            SystemCommands::Dns(args) => passthrough_with_args("system dns", vec!["system", "dns"], args),
-            SystemCommands::Kernel(args) => passthrough_with_args("system kernel", vec!["system", "kernel"], args),
-            SystemCommands::Logs(args) => passthrough_with_args("system logs", vec!["system", "logs"], args),
+            SystemCommands::Df(args) => {
+                passthrough_with_args("system df", vec!["system", "df"], args)
+            }
+            SystemCommands::Dns(args) => {
+                passthrough_with_args("system dns", vec!["system", "dns"], args)
+            }
+            SystemCommands::Kernel(args) => {
+                passthrough_with_args("system kernel", vec!["system", "kernel"], args)
+            }
+            SystemCommands::Logs(args) => {
+                passthrough_with_args("system logs", vec!["system", "logs"], args)
+            }
             SystemCommands::Property(args) => {
                 passthrough_with_args("system property", vec!["system", "property"], args)
             }
-            SystemCommands::Start(args) => passthrough_with_args("start system", vec!["system", "start"], args),
-            SystemCommands::Status(args) => passthrough_with_args("system status", vec!["system", "status"], args),
-            SystemCommands::Stop(args) => passthrough_with_args("stop system", vec!["system", "stop"], args),
+            SystemCommands::Start(args) => {
+                passthrough_with_args("start system", vec!["system", "start"], args)
+            }
+            SystemCommands::Status(args) => {
+                passthrough_with_args("system status", vec!["system", "status"], args)
+            }
+            SystemCommands::Stop(args) => {
+                passthrough_with_args("stop system", vec!["system", "stop"], args)
+            }
             SystemCommands::Version(args) => {
                 passthrough_with_args("system version", vec!["system", "version"], args)
             }
         }),
         ContainerRuntime::Podman => match command {
-            SystemCommands::Df(args) => {
-                Ok(passthrough_with_args("system df", vec!["system", "df"], args))
-            }
+            SystemCommands::Df(args) => Ok(passthrough_with_args(
+                "system df",
+                vec!["system", "df"],
+                args,
+            )),
             SystemCommands::Logs(args) => Ok(passthrough_with_args(
                 "system events",
                 vec!["system", "events"],
@@ -597,9 +665,11 @@ fn system_passthrough(
                 vec!["system", "info"],
                 args,
             )),
-            SystemCommands::Version(args) => {
-                Ok(passthrough_with_args("podman version", vec!["version"], args))
-            }
+            SystemCommands::Version(args) => Ok(passthrough_with_args(
+                "podman version",
+                vec!["version"],
+                args,
+            )),
             SystemCommands::Dns(_) => Err(unsupported_with_podman(
                 "system dns",
                 "Podman does not provide a system dns subcommand",
@@ -636,53 +706,73 @@ fn machine_passthrough(
             MachineCommands::Inspect(args) => {
                 passthrough_with_args("inspect machine", vec!["machine", "inspect"], args)
             }
-            MachineCommands::List(args) => passthrough_with_args("list machines", vec!["machine", "list"], args),
-            MachineCommands::Logs(args) => passthrough_with_args("machine logs", vec!["machine", "logs"], args),
+            MachineCommands::List(args) => {
+                passthrough_with_args("list machines", vec!["machine", "list"], args)
+            }
+            MachineCommands::Logs(args) => {
+                passthrough_with_args("machine logs", vec!["machine", "logs"], args)
+            }
             MachineCommands::Remove(args) => {
                 passthrough_with_args("remove machine", vec!["machine", "delete"], args)
             }
-            MachineCommands::Run(args) => passthrough_with_args("run machine command", vec!["machine", "run"], args),
-            MachineCommands::Set(args) => passthrough_with_args("set machine", vec!["machine", "set"], args),
+            MachineCommands::Run(args) => {
+                passthrough_with_args("run machine command", vec!["machine", "run"], args)
+            }
+            MachineCommands::Set(args) => {
+                passthrough_with_args("set machine", vec!["machine", "set"], args)
+            }
             MachineCommands::SetDefault(args) => {
                 passthrough_with_args("set default machine", vec!["machine", "set-default"], args)
             }
-            MachineCommands::Stop(args) => passthrough_with_args("stop machine", vec!["machine", "stop"], args),
+            MachineCommands::Stop(args) => {
+                passthrough_with_args("stop machine", vec!["machine", "stop"], args)
+            }
         }),
         ContainerRuntime::Podman => match command {
-            MachineCommands::Create(args) => {
-                Ok(passthrough_with_args("create machine", vec!["machine", "init"], args))
-            }
+            MachineCommands::Create(args) => Ok(passthrough_with_args(
+                "create machine",
+                vec!["machine", "init"],
+                args,
+            )),
             MachineCommands::Inspect(args) => Ok(passthrough_with_args(
                 "inspect machine",
                 vec!["machine", "inspect"],
                 args,
             )),
-            MachineCommands::List(args) => {
-                Ok(passthrough_with_args("list machines", vec!["machine", "list"], args))
-            }
+            MachineCommands::List(args) => Ok(passthrough_with_args(
+                "list machines",
+                vec!["machine", "list"],
+                args,
+            )),
             MachineCommands::Logs(args) => Ok(passthrough_with_args(
                 "show machine info",
                 vec!["machine", "info"],
                 args,
             )),
-            MachineCommands::Remove(args) => {
-                Ok(passthrough_with_args("remove machine", vec!["machine", "rm"], args))
-            }
+            MachineCommands::Remove(args) => Ok(passthrough_with_args(
+                "remove machine",
+                vec!["machine", "rm"],
+                args,
+            )),
             MachineCommands::Run(args) => Ok(passthrough_with_args(
                 "ssh into machine",
                 vec!["machine", "ssh"],
                 args,
             )),
-            MachineCommands::Set(args) => {
-                Ok(passthrough_with_args("set machine", vec!["machine", "set"], args))
-            }
+            MachineCommands::Set(args) => Ok(passthrough_with_args(
+                "set machine",
+                vec!["machine", "set"],
+                args,
+            )),
             MachineCommands::SetDefault(_) => Err(unsupported_with_podman(
                 "machine set-default",
                 "Podman machine does not provide a set-default subcommand",
             )),
-            MachineCommands::Stop(args) => {
-                Ok(passthrough_with_args("stop machine", vec!["machine", "stop"], args))
-            }
+            MachineCommands::Stop(args) => Ok(passthrough_with_args(
+                "stop machine",
+                vec!["machine", "stop"],
+                args,
+            )),
         },
     }
 }
@@ -1013,7 +1103,12 @@ fn ensure_container_user(
                 bootstrap_user_script().into(),
             ],
             interactive: false,
-            user: None,
+            user: Some(ResolvedUser {
+                username: "root".into(),
+                uid: 0,
+                gid: 0,
+                home: "/root".into(),
+            }),
         },
     )?;
     Ok(())
@@ -1076,21 +1171,26 @@ if [ -n "$existing_user" ]; then
 else
     uid_owner="$(lookup_user_by_uid "$uid")"
     if [ -n "$uid_owner" ] && [ "$uid_owner" != "$username" ]; then
-        echo "uid ${uid} already owned by ${uid_owner}, cannot map ${username}" >&2
-        exit 1
-    fi
-
-    if command -v useradd >/dev/null 2>&1; then
-        if useradd -K UID_MIN=0 -K UID_MAX=60000 -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"; then
-            :
-        else
-            useradd -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"
+        username="$uid_owner"
+        existing_user="$(lookup_user_by_name "$username")"
+        existing_gid="${existing_user##*:}"
+        if [ "$existing_gid" != "$gid" ]; then
+            echo "uid ${uid} already owned by ${uid_owner} with gid ${existing_gid}, expected ${gid}" >&2
+            exit 1
         fi
-    elif command -v adduser >/dev/null 2>&1; then
-        adduser -D -h "$home" -u "$uid" -G "$group_name" "$username"
     else
-        echo "missing useradd/adduser for ${username}" >&2
-        exit 1
+        if command -v useradd >/dev/null 2>&1; then
+            if useradd -K UID_MIN=0 -K UID_MAX=60000 -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"; then
+                :
+            else
+                useradd -m -d "$home" -u "$uid" -g "$gid" -s /bin/sh "$username"
+            fi
+        elif command -v adduser >/dev/null 2>&1; then
+            adduser -D -h "$home" -u "$uid" -G "$group_name" "$username"
+        else
+            echo "missing useradd/adduser for ${username}" >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -1376,13 +1476,12 @@ mod tests {
             ..MockBackend::default()
         };
 
-        let error =
-            ensure_container_system_running_with_prompt(
-                &backend,
-                ContainerRuntime::AppleContainer,
-                || Ok(false),
-            )
-            .unwrap_err();
+        let error = ensure_container_system_running_with_prompt(
+            &backend,
+            ContainerRuntime::AppleContainer,
+            || Ok(false),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("container system not running"));
         assert_eq!(*backend.system_starts.borrow(), 0);
     }
@@ -1620,7 +1719,8 @@ mod tests {
                 "useradd -m -d \"$home\" -u \"$uid\" -g \"$gid\" -s /bin/sh \"$username\""
             )
         );
-        assert_eq!(execs[0].user, None);
+        assert_eq!(execs[0].user.as_ref().map(|user| user.uid), Some(0));
+        assert_eq!(execs[0].user.as_ref().map(|user| user.gid), Some(0));
         assert_eq!(
             execs[1].env.iter().find(|(key, _)| key == "HOME"),
             Some(&(
@@ -1628,6 +1728,15 @@ mod tests {
                 format!("/home/{}", execs[1].user.as_ref().unwrap().username)
             ))
         );
+    }
+
+    #[test]
+    fn bootstrap_user_script_reuses_existing_uid_owner() {
+        let script = bootstrap_user_script();
+        assert!(script.contains("username=\"$uid_owner\""));
+        assert!(script.contains(
+            "uid ${uid} already owned by ${uid_owner} with gid ${existing_gid}, expected ${gid}"
+        ));
     }
 
     #[test]
@@ -2039,11 +2148,9 @@ mod tests {
             Cli {
                 debug: false,
                 config: None,
-                command: Commands::Machine(MachineCommands::SetDefault(
-                    OptionalPassthroughArgs {
-                        args: vec!["devvm".into()],
-                    },
-                )),
+                command: Commands::Machine(MachineCommands::SetDefault(OptionalPassthroughArgs {
+                    args: vec!["devvm".into()],
+                })),
             },
             &backend,
             ContainerRuntime::Podman,

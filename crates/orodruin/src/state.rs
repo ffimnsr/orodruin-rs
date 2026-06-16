@@ -39,8 +39,8 @@ pub fn parse_inspect_output(output: &str) -> Option<Value> {
 }
 
 fn parse_summary(value: Value) -> Option<ContainerSummary> {
-    let id = field(&value, &["id", "ID", "identifier", "name"])?;
-    let name = field(&value, &["name", "Name"]);
+    let id = field(&value, &["id", "Id", "ID", "identifier", "name"])?;
+    let name = field(&value, &["name", "Name"]).or_else(|| first_string_field(&value, &["Names"]));
     let status = field(&value, &["status", "Status", "state", "State"]);
     let running = value
         .get("running")
@@ -69,9 +69,22 @@ fn field(value: &Value, names: &[&str]) -> Option<String> {
     })
 }
 
+fn first_string_field(value: &Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        value.get(name).and_then(|value| {
+            value
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn list_parse_error_bubbles_up() {
@@ -81,5 +94,26 @@ mod tests {
                 .to_string()
                 .contains("failed to parse container list output")
         );
+    }
+
+    #[test]
+    fn parse_list_output_supports_podman_id_and_names() {
+        let parsed = parse_list_output(
+            &json!([
+                {
+                    "Id": "abc123",
+                    "Names": ["orodruin-demo"],
+                    "State": "running",
+                    "Status": "Up 10 seconds"
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "abc123");
+        assert_eq!(parsed[0].name.as_deref(), Some("orodruin-demo"));
+        assert!(parsed[0].matches("orodruin-demo"));
     }
 }
