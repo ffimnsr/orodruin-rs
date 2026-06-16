@@ -39,6 +39,7 @@ where
     run_with_backend_for_runtime(cli, &backend, runtime)
 }
 
+#[cfg(test)]
 fn run_with_backend(cli: Cli, backend: &dyn ContainerBackend) -> Result<(), OrodruinError> {
     run_with_backend_for_runtime(cli, backend, ContainerRuntime::AppleContainer)
 }
