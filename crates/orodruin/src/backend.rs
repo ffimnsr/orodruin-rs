@@ -577,7 +577,12 @@ mod tests {
         assert_eq!(list_spec.args, ["ps", "--all", "--format", "json"]);
         assert_eq!(delete_spec.program, "podman");
         assert_eq!(delete_spec.args, ["rm", "--force", "demo"]);
-        assert!(create_spec.args.windows(2).any(|window| window == ["--userns", "keep-id"]));
+        assert!(
+            create_spec
+                .args
+                .windows(2)
+                .any(|window| window == ["--userns", "keep-id"])
+        );
         assert!(create_spec.args.contains(
             &"type=bind,source=/tmp/app,target=/workspace/app,relabel=shared".to_string()
         ));
