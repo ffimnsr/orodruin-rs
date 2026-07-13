@@ -16,8 +16,8 @@ use crate::{
         ExecRequest,
     },
     cli::{
-        BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, EnvironmentName,
-        ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
+        BuilderCommands, Cli, Commands, CompletionCli, CompletionsCommand, ContainerCommands,
+        EnvironmentName, ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
         RequiredPassthroughArgs, ResourceCommands, RunCommand, SystemCommands,
     },
     config::{CONFIG_FILE_NAME, LoadedConfig, ProjectConfig, default_init_config},
@@ -289,7 +289,7 @@ fn render_completions(
     runtime: ContainerRuntime,
     command: CompletionsCommand,
 ) -> Result<String, OrodruinError> {
-    let mut cli = Cli::command_for_runtime(runtime);
+    let mut cli = CompletionCli::command_for_runtime(runtime);
     let mut output = Vec::new();
     let name = cli.get_name().to_string();
     generate(command.shell, &mut cli, name, &mut output);
@@ -2728,7 +2728,7 @@ mod tests {
         assert!(output.contains("completions"));
         assert!(output.contains("orodruin"));
         assert!(output.contains("inspect"));
-        assert!(output.contains("ssh"));
+        assert!(!output.contains("ssh"));
     }
 
     #[test]

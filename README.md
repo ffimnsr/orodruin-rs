@@ -109,7 +109,7 @@ orodruin run dev -- bash -lc 'pwd && id'
 - `orodruin` looks for `orodruin.toml` in the current directory and parent directories unless you pass `--config <path>`.
 - The config must define at least one environment under `[envs.<name>]`.
 - Every environment must define exactly one of `image` or `build`.
-- Use `project.default_env` when you want `enter` and `ssh` to work without explicitly naming an environment.
+- Use `project.default_env` when you want `enter` to work without explicitly naming an environment.
 
 ## Runtime Selection
 
@@ -135,7 +135,6 @@ Examples:
 | `orodruin init` | Create a starter `orodruin.toml` in the current directory | `orodruin init` |
 | `orodruin create <env>` | Create the environment container and start it if needed | `orodruin create dev` |
 | `orodruin enter [env]` | Open an interactive shell in the container | `orodruin enter` |
-| `orodruin ssh [env]` | SSH to the environment through its container network address | `orodruin ssh dev` |
 | `orodruin run <env> -- <command>` | Run a command inside the environment container | `orodruin run dev -- cargo test` |
 | `orodruin list` | Show configured environments and container state | `orodruin list` |
 | `orodruin rm <env>` | Remove an environment container | `orodruin rm dev` |
@@ -143,8 +142,7 @@ Examples:
 
 Notes:
 
-- `enter` and `ssh` default to `project.default_env` or the only configured environment when possible.
-- `ssh --print` shows the generated SSH command without executing it.
+- `enter` defaults to `project.default_env` or the only configured environment when possible.
 - `run` expects the command after `--`.
 
 ### Runtime Passthrough Commands

@@ -21,6 +21,22 @@ pub struct Cli {
     pub command: Commands,
 }
 
+#[derive(Debug, Parser, PartialEq, Eq)]
+#[command(
+    name = "orodruin",
+    version = crate::build_info::VERSION,
+    long_version = crate::build_info::LONG_VERSION,
+    about
+)]
+pub struct CompletionCli {
+    #[arg(long, global = true, action = ArgAction::SetTrue, help = "Enable debug logging")]
+    pub debug: bool,
+    #[arg(long, global = true, help = "Path to the orodruin config file")]
+    pub config: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: CompletionCommands,
+}
+
 impl Cli {
     pub fn parse_for_runtime<I, T>(args: I, runtime: ContainerRuntime) -> Result<Self, clap::Error>
     where
@@ -44,6 +60,21 @@ impl Cli {
         Self::from_arg_matches(&matches)
     }
 
+    pub fn command_for_runtime(runtime: ContainerRuntime) -> Command {
+        Self::command_for_runtime_named(runtime, "orodruin")
+    }
+
+    pub fn command_for_runtime_named(runtime: ContainerRuntime, program_name: &str) -> Command {
+        prune_command_for_runtime(
+            Self::command().bin_name(program_name.to_string()),
+            runtime,
+            &[],
+            "orodruin",
+        )
+    }
+}
+
+impl CompletionCli {
     pub fn command_for_runtime(runtime: ContainerRuntime) -> Command {
         Self::command_for_runtime_named(runtime, "orodruin")
     }
@@ -187,8 +218,94 @@ pub enum Commands {
     Create(EnvironmentName),
     #[command(about = "Open an interactive shell inside an environment container")]
     Enter(EnterCommand),
-    #[command(about = "SSH to an environment using the container network address")]
+    #[command(
+        about = "SSH to an environment using the container network address",
+        hide = true
+    )]
     Ssh(SshCommand),
+    #[command(about = "Run a command in an environment container")]
+    Run(RunCommand),
+    #[command(about = "List configured environments and their container state")]
+    List,
+    #[command(about = "Remove an environment container")]
+    Rm(EnvironmentName),
+    #[command(about = "Show the resolved configuration and container details for an environment")]
+    Inspect(EnvironmentName),
+    #[command(about = "Pull an image with the configured container runtime")]
+    Pull(RequiredPassthroughArgs),
+    #[command(about = "List local images with the configured container runtime")]
+    Images(OptionalPassthroughArgs),
+    #[command(about = "Remove an image with the configured container runtime")]
+    Rmi(RequiredPassthroughArgs),
+    #[command(about = "List containers with the configured container runtime")]
+    Ps(OptionalPassthroughArgs),
+    #[command(about = "Show container logs with the configured container runtime")]
+    Logs(OptionalPassthroughArgs),
+    #[command(about = "Build an image with the configured container runtime")]
+    Build(RequiredPassthroughArgs),
+    #[command(
+        about = "Copy files with the configured container runtime",
+        visible_alias = "cp"
+    )]
+    Copy(RequiredPassthroughArgs),
+    #[command(about = "Log in to a registry with the configured container runtime")]
+    Login(OptionalPassthroughArgs),
+    #[command(about = "Log out from a registry with the configured container runtime")]
+    Logout(OptionalPassthroughArgs),
+    #[command(
+        subcommand,
+        about = "Run image commands with the configured container runtime"
+    )]
+    Image(ImageCommands),
+    #[command(
+        subcommand,
+        about = "Run container commands with the configured container runtime"
+    )]
+    Container(ContainerCommands),
+    #[command(
+        subcommand,
+        about = "Run registry commands with the configured container runtime"
+    )]
+    Registry(RegistryCommands),
+    #[command(
+        subcommand,
+        about = "Run volume commands with the configured container runtime"
+    )]
+    Volume(ResourceCommands),
+    #[command(
+        subcommand,
+        about = "Run network commands with the configured container runtime"
+    )]
+    Network(ResourceCommands),
+    #[command(
+        subcommand,
+        about = "Run builder commands with the configured container runtime"
+    )]
+    Builder(BuilderCommands),
+    #[command(
+        subcommand,
+        about = "Run system commands with the configured container runtime"
+    )]
+    System(SystemCommands),
+    #[command(
+        subcommand,
+        about = "Run machine commands with the configured container runtime"
+    )]
+    Machine(MachineCommands),
+    #[command(about = "Generate shell completion scripts")]
+    Completions(CompletionsCommand),
+    #[command(about = "Show version, commit, date, and build information")]
+    Version,
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum CompletionCommands {
+    #[command(about = "Create a starter orodruin.toml in the current directory")]
+    Init,
+    #[command(about = "Create the container for an environment and start it if needed")]
+    Create(EnvironmentName),
+    #[command(about = "Open an interactive shell inside an environment container")]
+    Enter(EnterCommand),
     #[command(about = "Run a command in an environment container")]
     Run(RunCommand),
     #[command(about = "List configured environments and their container state")]
@@ -619,6 +736,16 @@ mod tests {
                 print: false,
             })
         );
+    }
+
+    #[test]
+    fn ssh_subcommand_hidden_from_help() {
+        let mut command = Cli::command();
+        let mut buffer = Vec::new();
+        command.write_long_help(&mut buffer).unwrap();
+        let help = String::from_utf8(buffer).unwrap();
+
+        assert!(!help.contains("ssh"));
     }
 
     #[test]
