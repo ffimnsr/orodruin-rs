@@ -10,3 +10,12 @@ tasks:
   install:
     commands:
       - cargo install --force --path crates/orodruin --all-features
+    description: Install the orodruin-cli binary.
+  format:
+    commands:
+      - cargo fmt --all
+    description: Format the code using rustfmt.
+  lint:
+    commands:
+      - cargo clippy --workspace --all-targets --all-features -- -D warnings
+    description: Lint the code using clippy and treat warnings as errors.
