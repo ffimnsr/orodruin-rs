@@ -5,9 +5,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::Serialize;
+
 use crate::config::{BuildConfig, EnvironmentConfig, ProjectConfig};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedEnvironment {
     pub project_name: String,
     pub environment_name: String,
@@ -25,21 +27,21 @@ pub struct ResolvedEnvironment {
     pub build: Option<ResolvedBuild>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedBuild {
     pub context: PathBuf,
     pub file: Option<PathBuf>,
     pub tag: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedMount {
     pub source: PathBuf,
     pub target: String,
     pub readonly: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedUser {
     pub username: String,
     pub uid: u32,

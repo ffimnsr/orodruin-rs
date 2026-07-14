@@ -2,22 +2,18 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, BufRead, Write},
-    net::IpAddr,
     path::Path,
-    process::{Command as ProcessCommand, Stdio},
 };
 
 use clap_complete::generate;
+use serde::Serialize;
 use serde_json::{Value, to_string_pretty};
 
 use crate::{
-    backend::{
-        BackendError, CommandSpec, ContainerBackend, ContainerCliBackend, ContainerRuntime,
-        ExecRequest,
-    },
+    backend::{BackendError, ContainerBackend, ContainerCliBackend, ContainerRuntime, ExecRequest},
     cli::{
-        BuilderCommands, Cli, Commands, CompletionCli, CompletionsCommand, ContainerCommands,
-        EnvironmentName, ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
+        BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, EnvironmentName,
+        ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
         RequiredPassthroughArgs, ResourceCommands, RunCommand, SystemCommands,
     },
     config::{CONFIG_FILE_NAME, LoadedConfig, ProjectConfig, default_init_config},
@@ -30,6 +26,26 @@ struct PassthroughInvocation {
     step: String,
     command: Vec<String>,
     requires_container_system: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ListEntry {
+    env: String,
+    container: String,
+    state: String,
+    running: bool,
+    exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectReport<'a> {
+    env: &'a str,
+    container: &'a str,
+    image: &'a str,
+    workdir: &'a str,
+    container_exists: bool,
+    resolved: &'a ResolvedEnvironment,
+    inspect: Option<Value>,
 }
 
 pub fn run<I, T>(args: I) -> Result<(), OrodruinError>
@@ -61,19 +77,20 @@ fn run_with_backend_for_runtime(
     backend: &dyn ContainerBackend,
     runtime: ContainerRuntime,
 ) -> Result<(), OrodruinError> {
+    let prompt = prompt_strategy(cli.yes);
     match cli.command {
         Commands::Init => init_command()?,
         Commands::Create(environment) => {
             let loaded = load_config(cli.config.as_deref())?;
             let resolved = resolve_environment(&loaded, &environment)?;
-            materialize_environment_for_runtime(backend, runtime, &resolved)?;
+            materialize_environment_for_runtime_with_prompt(backend, runtime, &resolved, prompt)?;
             println!("ready {}", resolved.container_name);
         }
         Commands::Enter(environment) => {
             let loaded = load_config(cli.config.as_deref())?;
             let resolved =
                 resolve_optional_environment(&loaded, environment.env.as_deref(), "enter")?;
-            materialize_environment_for_runtime(backend, runtime, &resolved)?;
+            materialize_environment_for_runtime_with_prompt(backend, runtime, &resolved, prompt)?;
             ensure_container_user(backend, &resolved)?;
             match backend.exec(
                 &resolved.container_name,
@@ -90,23 +107,11 @@ fn run_with_backend_for_runtime(
                 Err(error) => return Err(error.into()),
             }
         }
-        Commands::Ssh(command) => {
-            let loaded = load_config(cli.config.as_deref())?;
-            let resolved = resolve_optional_environment(&loaded, command.env.as_deref(), "ssh")?;
-            materialize_environment_for_runtime(backend, runtime, &resolved)?;
-            ensure_container_user(backend, &resolved)?;
-            let target = resolve_ssh_target(backend, &resolved)?;
-            let spec = build_ssh_spec(&resolved, &target);
-            if command.print {
-                println!("{}", spec.render());
-            } else {
-                run_host_command(&spec)?;
-            }
-        }
+
         Commands::Run(run) => {
             let loaded = load_config(cli.config.as_deref())?;
             let resolved = resolve_optional_environment(&loaded, run.env.as_deref(), "run")?;
-            materialize_environment_for_runtime(backend, runtime, &resolved)?;
+            materialize_environment_for_runtime_with_prompt(backend, runtime, &resolved, prompt)?;
             let command = resolve_run_command(&resolved, run)?;
             ensure_container_user(backend, &resolved)?;
             backend.exec(
@@ -120,14 +125,25 @@ fn run_with_backend_for_runtime(
                 },
             )?;
         }
-        Commands::List => {
+        Commands::List(command) => {
             let loaded = load_config(cli.config.as_deref())?;
-            list_environments(backend, runtime, &loaded)?;
+            if command.json {
+                print_json(&list_environment_entries_with_prompt(
+                    backend, runtime, &loaded, prompt,
+                )?)?;
+            } else {
+                list_environments_with_prompt(backend, runtime, &loaded, prompt)?;
+            }
         }
         Commands::Rm(environment) => {
             let loaded = load_config(cli.config.as_deref())?;
             let resolved = resolve_environment(&loaded, &environment)?;
-            if !container_exists_for_runtime(backend, runtime, &resolved.container_name)? {
+            if !container_exists_for_runtime_with_prompt(
+                backend,
+                runtime,
+                &resolved.container_name,
+                prompt,
+            )? {
                 return Err(OrodruinError::Message(format!(
                     "environment `{}` is not created",
                     resolved.environment_name
@@ -136,71 +152,91 @@ fn run_with_backend_for_runtime(
             backend.delete(&resolved.container_name)?;
             println!("removed {}", resolved.container_name);
         }
-        Commands::Inspect(environment) => {
+        Commands::Inspect(command) => {
             let loaded = load_config(cli.config.as_deref())?;
-            let resolved = resolve_environment(&loaded, &environment)?;
-            println!("env: {}", resolved.environment_name);
-            println!("container: {}", resolved.container_name);
-            println!("image: {}", resolved.image);
-            println!("workdir: {}", resolved.workdir);
-            if !container_exists_for_runtime(backend, runtime, &resolved.container_name)? {
-                println!("container not created");
-                return Ok(());
-            }
-            let inspect = backend.inspect_raw(&resolved.container_name)?;
-            match inspect {
-                Some(value) => println!(
-                    "{}",
-                    to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
-                ),
-                None => println!("container not created"),
+            let resolved = resolve_environment_by_name(&loaded, &command.env)?;
+            let report = inspect_environment_with_prompt(backend, runtime, &resolved, prompt)?;
+            if command.json {
+                print_json(&report)?;
+            } else {
+                print_inspect_report(&report);
             }
         }
-        Commands::Pull(args) => run_passthrough(backend, runtime, pull_passthrough(runtime, args))?,
+        Commands::Pull(args) => {
+            run_passthrough(backend, runtime, pull_passthrough(runtime, args), prompt)?
+        }
         Commands::Images(args) => {
-            run_passthrough(backend, runtime, images_passthrough(runtime, args))?
+            run_passthrough(backend, runtime, images_passthrough(runtime, args), prompt)?
         }
-        Commands::Rmi(args) => run_passthrough(backend, runtime, rmi_passthrough(runtime, args))?,
-        Commands::Ps(args) => run_passthrough(backend, runtime, ps_passthrough(runtime, args))?,
-        Commands::Logs(args) => run_passthrough(backend, runtime, logs_passthrough(runtime, args))?,
+        Commands::Rmi(args) => {
+            run_passthrough(backend, runtime, rmi_passthrough(runtime, args), prompt)?
+        }
+        Commands::Ps(args) => {
+            run_passthrough(backend, runtime, ps_passthrough(runtime, args), prompt)?
+        }
+        Commands::Logs(args) => {
+            run_passthrough(backend, runtime, logs_passthrough(runtime, args), prompt)?
+        }
         Commands::Build(args) => {
-            run_passthrough(backend, runtime, build_passthrough(runtime, args))?
+            run_passthrough(backend, runtime, build_passthrough(runtime, args), prompt)?
         }
-        Commands::Copy(args) => run_passthrough(backend, runtime, copy_passthrough(runtime, args))?,
+        Commands::Copy(args) => {
+            run_passthrough(backend, runtime, copy_passthrough(runtime, args), prompt)?
+        }
         Commands::Login(args) => {
-            run_passthrough(backend, runtime, login_passthrough(runtime, args))?
+            run_passthrough(backend, runtime, login_passthrough(runtime, args), prompt)?
         }
         Commands::Logout(args) => {
-            run_passthrough(backend, runtime, logout_passthrough(runtime, args))?
+            run_passthrough(backend, runtime, logout_passthrough(runtime, args), prompt)?
         }
-        Commands::Image(command) => {
-            run_passthrough(backend, runtime, image_passthrough(runtime, command)?)?
-        }
-        Commands::Container(command) => {
-            run_passthrough(backend, runtime, container_passthrough(runtime, command))?
-        }
-        Commands::Registry(command) => {
-            run_passthrough(backend, runtime, registry_passthrough(runtime, command)?)?
-        }
+        Commands::Image(command) => run_passthrough(
+            backend,
+            runtime,
+            image_passthrough(runtime, command)?,
+            prompt,
+        )?,
+        Commands::Container(command) => run_passthrough(
+            backend,
+            runtime,
+            container_passthrough(runtime, command),
+            prompt,
+        )?,
+        Commands::Registry(command) => run_passthrough(
+            backend,
+            runtime,
+            registry_passthrough(runtime, command)?,
+            prompt,
+        )?,
         Commands::Volume(command) => run_passthrough(
             backend,
             runtime,
             resource_passthrough(runtime, "volume", command),
+            prompt,
         )?,
         Commands::Network(command) => run_passthrough(
             backend,
             runtime,
             resource_passthrough(runtime, "network", command),
+            prompt,
         )?,
-        Commands::Builder(command) => {
-            run_passthrough(backend, runtime, builder_passthrough(runtime, command)?)?
-        }
-        Commands::System(command) => {
-            run_passthrough(backend, runtime, system_passthrough(runtime, command)?)?
-        }
-        Commands::Machine(command) => {
-            run_passthrough(backend, runtime, machine_passthrough(runtime, command)?)?
-        }
+        Commands::Builder(command) => run_passthrough(
+            backend,
+            runtime,
+            builder_passthrough(runtime, command)?,
+            prompt,
+        )?,
+        Commands::System(command) => run_passthrough(
+            backend,
+            runtime,
+            system_passthrough(runtime, command)?,
+            prompt,
+        )?,
+        Commands::Machine(command) => run_passthrough(
+            backend,
+            runtime,
+            machine_passthrough(runtime, command)?,
+            prompt,
+        )?,
         Commands::Completions(command) => print!("{}", render_completions(runtime, command)?),
         Commands::Version => println!("{}", crate::build_info::render()),
     }
@@ -212,13 +248,9 @@ fn run_passthrough(
     backend: &dyn ContainerBackend,
     runtime: ContainerRuntime,
     invocation: PassthroughInvocation,
+    prompt: fn() -> Result<bool, OrodruinError>,
 ) -> Result<(), OrodruinError> {
-    run_passthrough_with_prompt(
-        backend,
-        runtime,
-        invocation,
-        prompt_to_start_container_system,
-    )
+    run_passthrough_with_prompt(backend, runtime, invocation, prompt)
 }
 
 fn run_passthrough_with_prompt(
@@ -286,7 +318,7 @@ fn render_completions(
     runtime: ContainerRuntime,
     command: CompletionsCommand,
 ) -> Result<String, OrodruinError> {
-    let mut cli = CompletionCli::command_for_runtime(runtime);
+    let mut cli = Cli::command_for_runtime(runtime);
     let mut output = Vec::new();
     let name = cli.get_name().to_string();
     generate(command.shell, &mut cli, name, &mut output);
@@ -964,6 +996,27 @@ impl From<RequiredPassthroughArgs> for Vec<String> {
     }
 }
 
+fn prompt_strategy(auto_yes: bool) -> fn() -> Result<bool, OrodruinError> {
+    if auto_yes {
+        auto_yes_prompt
+    } else {
+        prompt_to_start_container_system
+    }
+}
+
+fn auto_yes_prompt() -> Result<bool, OrodruinError> {
+    Ok(true)
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<(), OrodruinError> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value)
+            .map_err(|error| OrodruinError::Message(error.to_string()))?
+    );
+    Ok(())
+}
+
 fn init_command() -> Result<(), OrodruinError> {
     let cwd = std::env::current_dir()?;
     let path = cwd.join(CONFIG_FILE_NAME);
@@ -1067,111 +1120,6 @@ fn resolve_run_command(
     })
 }
 
-fn resolve_ssh_target(
-    backend: &dyn ContainerBackend,
-    resolved: &ResolvedEnvironment,
-) -> Result<String, OrodruinError> {
-    let inspect = backend
-        .inspect_raw(&resolved.container_name)?
-        .ok_or_else(|| {
-            OrodruinError::Message(format!(
-                "container `{}` is running but inspect returned no payload",
-                resolved.container_name
-            ))
-        })?;
-
-    ssh_host_from_inspect(&inspect).ok_or_else(|| {
-        OrodruinError::Message(format!(
-            "could not determine an ssh host for `{}` from container inspect output",
-            resolved.container_name
-        ))
-    })
-}
-
-fn ssh_host_from_inspect(value: &Value) -> Option<String> {
-    if let Some(host) = value
-        .get("status")
-        .and_then(|status| status.get("networks"))
-        .and_then(Value::as_array)
-        .and_then(|networks| {
-            networks.iter().find_map(|network| {
-                find_ip_field(network, &["ipv4Address", "ipAddress", "address"])
-            })
-        })
-    {
-        return Some(host);
-    }
-
-    find_ip_field(
-        value,
-        &["ipv4Address", "ipAddress", "ip_address", "IPAddress", "ip"],
-    )
-}
-
-fn find_ip_field(value: &Value, field_names: &[&str]) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            for field_name in field_names {
-                if let Some(candidate) = map.get(*field_name).and_then(Value::as_str)
-                    && let Some(host) = normalize_ip(candidate)
-                {
-                    return Some(host);
-                }
-            }
-
-            map.values()
-                .find_map(|nested| find_ip_field(nested, field_names))
-        }
-        Value::Array(values) => values
-            .iter()
-            .find_map(|nested| find_ip_field(nested, field_names)),
-        Value::String(candidate) => normalize_ip(candidate),
-        _ => None,
-    }
-}
-
-fn normalize_ip(candidate: &str) -> Option<String> {
-    let host = candidate.split('/').next()?.trim();
-    host.parse::<IpAddr>().ok().map(|_| host.to_string())
-}
-
-fn build_ssh_spec(resolved: &ResolvedEnvironment, host: &str) -> CommandSpec {
-    CommandSpec {
-        program: "ssh".into(),
-        args: vec![format!("{}@{host}", resolved.user.username)],
-    }
-}
-
-fn run_host_command(spec: &CommandSpec) -> Result<(), OrodruinError> {
-    let status = ProcessCommand::new(&spec.program)
-        .args(&spec.args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-    if status.success() {
-        return Ok(());
-    }
-
-    Err(OrodruinError::CommandFailed {
-        command: spec.render(),
-        status: status.code(),
-    })
-}
-
-fn materialize_environment_for_runtime(
-    backend: &dyn ContainerBackend,
-    runtime: ContainerRuntime,
-    resolved: &ResolvedEnvironment,
-) -> Result<(), OrodruinError> {
-    materialize_environment_for_runtime_with_prompt(
-        backend,
-        runtime,
-        resolved,
-        prompt_to_start_container_system,
-    )
-}
-
 fn materialize_environment_for_runtime_with_prompt(
     backend: &dyn ContainerBackend,
     runtime: ContainerRuntime,
@@ -1180,19 +1128,6 @@ fn materialize_environment_for_runtime_with_prompt(
 ) -> Result<(), OrodruinError> {
     ensure_container_system_running_with_prompt(backend, runtime, prompt)?;
     materialize_environment(backend, resolved)
-}
-
-fn container_exists_for_runtime(
-    backend: &dyn ContainerBackend,
-    runtime: ContainerRuntime,
-    container_name: &str,
-) -> Result<bool, OrodruinError> {
-    container_exists_for_runtime_with_prompt(
-        backend,
-        runtime,
-        container_name,
-        prompt_to_start_container_system,
-    )
 }
 
 fn container_exists_for_runtime_with_prompt(
@@ -1205,12 +1140,26 @@ fn container_exists_for_runtime_with_prompt(
     container_exists(backend, container_name)
 }
 
-fn list_environments(
+fn list_environment_entries_with_prompt(
     backend: &dyn ContainerBackend,
     runtime: ContainerRuntime,
     loaded: &LoadedConfig,
-) -> Result<(), OrodruinError> {
-    list_environments_with_prompt(backend, runtime, loaded, prompt_to_start_container_system)
+    prompt: impl FnOnce() -> Result<bool, OrodruinError>,
+) -> Result<Vec<ListEntry>, OrodruinError> {
+    ensure_container_system_running_with_prompt(backend, runtime, prompt)?;
+    let containers = backend.list_all()?;
+    loaded
+        .config
+        .envs
+        .iter()
+        .map(|(name, config)| {
+            let resolved = ResolvedEnvironment::resolve(&loaded.root, &loaded.config, name, config);
+            let summary = containers
+                .iter()
+                .find(|summary| summary.matches(&resolved.container_name));
+            Ok(summary_entry(name, &resolved.container_name, summary))
+        })
+        .collect()
 }
 
 fn list_environments_with_prompt(
@@ -1219,14 +1168,9 @@ fn list_environments_with_prompt(
     loaded: &LoadedConfig,
     prompt: impl FnOnce() -> Result<bool, OrodruinError>,
 ) -> Result<(), OrodruinError> {
-    ensure_container_system_running_with_prompt(backend, runtime, prompt)?;
-    let containers = backend.list_all()?;
-    for (name, config) in &loaded.config.envs {
-        let resolved = ResolvedEnvironment::resolve(&loaded.root, &loaded.config, name, config);
-        let summary = containers
-            .iter()
-            .find(|summary| summary.matches(&resolved.container_name));
-        print_summary(name, &resolved.container_name, summary);
+    let entries = list_environment_entries_with_prompt(backend, runtime, loaded, prompt)?;
+    for entry in entries {
+        println!("{}\t{}\t{}", entry.env, entry.container, entry.state);
     }
     Ok(())
 }
@@ -1275,7 +1219,7 @@ fn ensure_container_system_running_with_prompt(
     }
 
     Err(OrodruinError::Message(
-        "container system not running; start it first with `container system start`".into(),
+        "container system is not running; start it with `container system start` or rerun with `--yes` to allow automatic startup".into(),
     ))
 }
 
@@ -1443,13 +1387,76 @@ fn container_exists(
         .any(|summary| summary.matches(container_name)))
 }
 
-fn print_summary(name: &str, container_name: &str, summary: Option<&ContainerSummary>) {
-    let state = match summary {
-        Some(summary) if summary.running => "running",
-        Some(summary) => summary.status.as_deref().unwrap_or("created"),
-        None => "not-created",
+fn inspect_environment_with_prompt<'a>(
+    backend: &dyn ContainerBackend,
+    runtime: ContainerRuntime,
+    resolved: &'a ResolvedEnvironment,
+    prompt: impl FnOnce() -> Result<bool, OrodruinError>,
+) -> Result<InspectReport<'a>, OrodruinError> {
+    let container_exists = container_exists_for_runtime_with_prompt(
+        backend,
+        runtime,
+        &resolved.container_name,
+        prompt,
+    )?;
+    let inspect = if container_exists {
+        backend.inspect_raw(&resolved.container_name)?
+    } else {
+        None
     };
-    println!("{name}\t{container_name}\t{state}");
+
+    Ok(InspectReport {
+        env: &resolved.environment_name,
+        container: &resolved.container_name,
+        image: &resolved.image,
+        workdir: &resolved.workdir,
+        container_exists,
+        resolved,
+        inspect,
+    })
+}
+
+fn summary_entry(
+    name: &str,
+    container_name: &str,
+    summary: Option<&ContainerSummary>,
+) -> ListEntry {
+    let (state, running, exists) = match summary {
+        Some(summary) if summary.running => (String::from("running"), true, true),
+        Some(summary) => (
+            summary.status.as_deref().unwrap_or("created").to_string(),
+            false,
+            true,
+        ),
+        None => (String::from("not-created"), false, false),
+    };
+
+    ListEntry {
+        env: name.to_string(),
+        container: container_name.to_string(),
+        state,
+        running,
+        exists,
+    }
+}
+
+fn print_inspect_report(report: &InspectReport<'_>) {
+    println!("env: {}", report.env);
+    println!("container: {}", report.container);
+    println!("image: {}", report.image);
+    println!("workdir: {}", report.workdir);
+    if !report.container_exists {
+        println!("container not created");
+        return;
+    }
+
+    match &report.inspect {
+        Some(value) => println!(
+            "{}",
+            to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        ),
+        None => println!("container not created"),
+    }
 }
 
 #[cfg(test)]
@@ -1468,8 +1475,8 @@ mod tests {
         backend::{BackendError, CommandSpec},
         cli::{
             BuilderCommands, Commands, ContainerCommands, EnterCommand, ImageCommands,
-            MachineCommands, OptionalPassthroughArgs, RegistryCommands, ResourceCommands,
-            SshCommand, SystemCommands,
+            InspectCommand, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
+            ResourceCommands, SystemCommands,
         },
         config::{EnvironmentConfig, ProjectMetadata},
         env_model::ResolvedBuild,
@@ -1635,6 +1642,7 @@ mod tests {
 
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Create(EnvironmentName { env: "dev".into() }),
         };
@@ -1660,6 +1668,7 @@ mod tests {
 
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
@@ -1716,7 +1725,12 @@ mod tests {
             || Ok(false),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("container system not running"));
+        assert!(
+            error
+                .to_string()
+                .contains("container system is not running")
+        );
+        assert!(error.to_string().contains("--yes"));
         assert_eq!(*backend.system_starts.borrow(), 0);
     }
 
@@ -1751,6 +1765,57 @@ mod tests {
         let mut stderr = Vec::new();
         let declined = prompt_to_start_container_system_with_io(&mut stdin, &mut stderr).unwrap();
         assert!(!declined);
+    }
+
+    #[test]
+    fn auto_yes_starts_container_system_without_prompt() {
+        let backend = MockBackend {
+            system_running_results: RefCell::new(VecDeque::from([Ok(false)])),
+            ..MockBackend::default()
+        };
+
+        ensure_container_system_running_with_prompt(
+            &backend,
+            ContainerRuntime::AppleContainer,
+            prompt_strategy(true),
+        )
+        .unwrap();
+
+        assert_eq!(*backend.system_starts.borrow(), 1);
+    }
+
+    #[test]
+    fn list_entries_include_state_metadata() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+        let loaded = load_config(None).unwrap();
+        let dev_name = resolved_name(tempdir.path(), "dev");
+
+        let backend = MockBackend::with_lists(vec![vec![ContainerSummary {
+            id: dev_name.clone(),
+            name: Some(dev_name.clone()),
+            status: Some("Up 10 seconds".into()),
+            running: true,
+        }]]);
+
+        let entries = list_environment_entries_with_prompt(
+            &backend,
+            ContainerRuntime::Podman,
+            &loaded,
+            || Ok(true),
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].env, "ci");
+        assert!(!entries[0].exists);
+        assert_eq!(entries[0].state, "not-created");
+        assert_eq!(entries[1].env, "dev");
+        assert!(entries[1].exists);
+        assert!(entries[1].running);
+        assert_eq!(entries[1].container, dev_name);
+        assert_eq!(entries[1].state, "running");
     }
 
     #[test]
@@ -1901,12 +1966,13 @@ mod tests {
                 step: "exec command".into(),
                 command: "container exec demo /bin/bash".into(),
                 status: Some(127),
-                stderr: String::new(),
+                detail: "the container runtime exited unsuccessfully".into(),
             }),
         ]);
 
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
@@ -1936,6 +2002,7 @@ mod tests {
 
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Rm(EnvironmentName { env: "dev".into() }),
         };
@@ -1954,6 +2021,7 @@ mod tests {
 
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Run(RunCommand {
                 env: Some("ci".into()),
@@ -1996,6 +2064,7 @@ mod tests {
 
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Run(RunCommand {
                 env: None,
@@ -2046,8 +2115,12 @@ mod tests {
         let backend = MockBackend::with_lists(vec![vec![]]);
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
-            command: Commands::Inspect(EnvironmentName { env: "dev".into() }),
+            command: Commands::Inspect(InspectCommand {
+                env: "dev".into(),
+                json: false,
+            }),
         };
 
         run_with_backend(cli, &backend).unwrap();
@@ -2070,6 +2143,7 @@ mod tests {
 
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Create(EnvironmentName { env: "ci".into() }),
         };
@@ -2114,6 +2188,7 @@ mod tests {
         let backend = MockBackend::with_lists(vec![vec![]]);
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
@@ -2155,6 +2230,7 @@ mod tests {
         let backend = MockBackend::default();
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Pull(RequiredPassthroughArgs {
                 args: vec!["alpine:latest".into()],
@@ -2173,6 +2249,7 @@ mod tests {
         let backend = MockBackend::default();
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Ps(OptionalPassthroughArgs {
                 args: vec!["--all".into()],
@@ -2193,6 +2270,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
                     args: vec![],
@@ -2205,6 +2283,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Image(ImageCommands::Prune(OptionalPassthroughArgs {
                     args: vec![],
@@ -2217,6 +2296,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Volume(ResourceCommands::Remove(RequiredPassthroughArgs {
                     args: vec!["cache".into()],
@@ -2239,6 +2319,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Image(ImageCommands::Inspect(RequiredPassthroughArgs {
                     args: vec!["alpine:latest".into()],
@@ -2251,6 +2332,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Image(ImageCommands::Push(RequiredPassthroughArgs {
                     args: vec!["demo:latest".into()],
@@ -2263,6 +2345,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Image(ImageCommands::Tag(RequiredPassthroughArgs {
                     args: vec!["demo:latest".into(), "demo:v1".into()],
@@ -2288,6 +2371,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Image(ImageCommands::Load(OptionalPassthroughArgs {
                     args: vec!["-i".into(), "image.tar".into()],
@@ -2300,6 +2384,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Image(ImageCommands::Save(OptionalPassthroughArgs {
                     args: vec!["-o".into(), "image.tar".into(), "demo:latest".into()],
@@ -2324,6 +2409,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Container(ContainerCommands::Inspect(RequiredPassthroughArgs {
                     args: vec!["demo".into()],
@@ -2336,6 +2422,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Container(ContainerCommands::Start(RequiredPassthroughArgs {
                     args: vec!["demo".into()],
@@ -2348,6 +2435,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Container(ContainerCommands::Stop(RequiredPassthroughArgs {
                     args: vec!["demo".into()],
@@ -2360,6 +2448,7 @@ mod tests {
         run_with_backend(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Container(ContainerCommands::Prune(OptionalPassthroughArgs {
                     args: vec![],
@@ -2403,6 +2492,7 @@ mod tests {
             run_with_backend(
                 Cli {
                     debug: false,
+                    yes: false,
                     config: None,
                     command,
                 },
@@ -2441,6 +2531,7 @@ mod tests {
             run_with_backend(
                 Cli {
                     debug: false,
+                    yes: false,
                     config: None,
                     command,
                 },
@@ -2501,6 +2592,7 @@ mod tests {
             run_with_backend_for_runtime(
                 Cli {
                     debug: false,
+                    yes: false,
                     config: None,
                     command,
                 },
@@ -2532,6 +2624,7 @@ mod tests {
         let system_error = run_with_backend_for_runtime(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::System(SystemCommands::Dns(OptionalPassthroughArgs {
                     args: vec![],
@@ -2545,6 +2638,7 @@ mod tests {
         let registry_error = run_with_backend_for_runtime(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
                     args: vec![],
@@ -2558,6 +2652,7 @@ mod tests {
         let machine_error = run_with_backend_for_runtime(
             Cli {
                 debug: false,
+                yes: false,
                 config: None,
                 command: Commands::Machine(MachineCommands::SetDefault(OptionalPassthroughArgs {
                     args: vec!["devvm".into()],
@@ -2596,53 +2691,13 @@ mod tests {
         let backend = MockBackend::with_lists(vec![vec![]]);
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Enter(EnterCommand { env: None }),
         };
 
         run_with_backend(cli, &backend).unwrap();
         assert_eq!(backend.builds.borrow().as_slice(), ["demo-ci:dev"]);
-    }
-
-    #[test]
-    fn ssh_print_uses_project_default_env_when_omitted() {
-        let tempdir = tempfile::tempdir().unwrap();
-        fs::write(
-            tempdir.path().join(CONFIG_FILE_NAME),
-            r#"
-                [project]
-                name = "demo"
-                default_env = "ci"
-
-                [envs.dev]
-                image = "ubuntu:latest"
-
-                [envs.ci]
-                build = { context = ".", file = "Containerfile", tag = "demo-ci:dev" }
-            "#,
-        )
-        .unwrap();
-        let _guard = CurrentDirGuard::enter(tempdir.path());
-        let container_name = resolved_name(tempdir.path(), "ci");
-
-        let backend = MockBackend::with_lists(vec![vec![]]);
-        *backend.inspect_value.borrow_mut() = Some(json!({
-            "status": {
-                "networks": [{ "ipv4Address": "192.168.64.2/24" }]
-            }
-        }));
-        let cli = Cli {
-            debug: false,
-            config: None,
-            command: Commands::Ssh(SshCommand {
-                env: None,
-                print: true,
-            }),
-        };
-
-        run_with_backend(cli, &backend).unwrap();
-        assert_eq!(backend.builds.borrow().as_slice(), ["demo-ci:dev"]);
-        assert_eq!(backend.inspect_calls.borrow().as_slice(), [container_name]);
     }
 
     #[test]
@@ -2666,6 +2721,7 @@ mod tests {
         let backend = MockBackend::with_lists(vec![vec![]]);
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Enter(EnterCommand { env: None }),
         };
@@ -2683,75 +2739,13 @@ mod tests {
         let backend = MockBackend::default();
         let cli = Cli {
             debug: false,
+            yes: false,
             config: None,
             command: Commands::Enter(EnterCommand { env: None }),
         };
 
         let error = run_with_backend(cli, &backend).unwrap_err();
         assert!(error.to_string().contains("set project.default_env"));
-    }
-
-    #[test]
-    fn ssh_without_env_errors_when_ambiguous() {
-        let tempdir = tempfile::tempdir().unwrap();
-        write_config(tempdir.path());
-        let _guard = CurrentDirGuard::enter(tempdir.path());
-
-        let backend = MockBackend::default();
-        let cli = Cli {
-            debug: false,
-            config: None,
-            command: Commands::Ssh(SshCommand {
-                env: None,
-                print: true,
-            }),
-        };
-
-        let error = run_with_backend(cli, &backend).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("`orodruin ssh` needs an environment name")
-        );
-    }
-
-    #[test]
-    fn ssh_host_uses_network_ipv4_address_without_cidr() {
-        let host = ssh_host_from_inspect(&json!({
-            "status": {
-                "networks": [{
-                    "ipv4Address": "192.168.64.2/24",
-                    "ipv6Address": "fdc8:9ac1:53c8:9dd2:f85b:11ff:fe51:30c9/64"
-                }]
-            }
-        }));
-
-        assert_eq!(host.as_deref(), Some("192.168.64.2"));
-    }
-
-    #[test]
-    fn ssh_print_errors_when_inspect_has_no_ip() {
-        let tempdir = tempfile::tempdir().unwrap();
-        write_config(tempdir.path());
-        let _guard = CurrentDirGuard::enter(tempdir.path());
-
-        let backend = MockBackend::with_lists(vec![vec![]]);
-        *backend.inspect_value.borrow_mut() = Some(json!({ "status": { "state": "running" } }));
-        let cli = Cli {
-            debug: false,
-            config: None,
-            command: Commands::Ssh(SshCommand {
-                env: Some("dev".into()),
-                print: true,
-            }),
-        };
-
-        let error = run_with_backend(cli, &backend).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("could not determine an ssh host")
-        );
     }
 
     #[test]

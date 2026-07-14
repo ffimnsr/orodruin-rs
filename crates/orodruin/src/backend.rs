@@ -237,19 +237,16 @@ impl ContainerCliBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .map_err(|source| BackendError::Spawn {
-                step: step.to_string(),
-                command: spec.render(),
-                source,
-            })?;
+            .map_err(|source| spawn_error(step, spec, source))?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(BackendError::CommandFailed {
             step: step.to_string(),
             command: spec.render(),
             status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            detail: command_failure_detail(&stderr),
         })
     }
 
@@ -263,11 +260,7 @@ impl ContainerCliBackend {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .map_err(|source| BackendError::Spawn {
-                step: step.to_string(),
-                command: spec.render(),
-                source,
-            })?;
+            .map_err(|source| spawn_error(step, spec, source))?;
         if status.success() {
             return Ok(());
         }
@@ -275,7 +268,7 @@ impl ContainerCliBackend {
             step: step.to_string(),
             command: spec.render(),
             status: status.code(),
-            stderr: String::new(),
+            detail: command_failure_detail(""),
         })
     }
 }
@@ -356,21 +349,20 @@ impl ContainerBackend for ContainerCliBackend {
 
 #[derive(Debug, Error)]
 pub enum BackendError {
-    #[error("failed to spawn `{command}` while attempting to {step}: {source}")]
+    #[error("{program} is not installed or not available on PATH")]
+    MissingProgram { program: String },
+    #[error("could not start the container runtime while attempting to {step}: {source}")]
     Spawn {
         step: String,
-        command: String,
         #[source]
         source: io::Error,
     },
-    #[error(
-        "`{command}` failed while attempting to {step}; exit status: {status:?}; stderr: {stderr}"
-    )]
+    #[error("failed to {step}: {detail}")]
     CommandFailed {
         step: String,
         command: String,
         status: Option<i32>,
-        stderr: String,
+        detail: String,
     },
     #[error(transparent)]
     State(#[from] StateError),
@@ -384,6 +376,35 @@ impl BackendError {
             } => *code,
             _ => 1,
         }
+    }
+}
+
+fn spawn_error(step: &str, spec: &CommandSpec, source: io::Error) -> BackendError {
+    if source.kind() == io::ErrorKind::NotFound {
+        return BackendError::MissingProgram {
+            program: runtime_program_display(&spec.program).to_string(),
+        };
+    }
+
+    BackendError::Spawn {
+        step: step.to_string(),
+        source,
+    }
+}
+
+fn command_failure_detail(stderr: &str) -> String {
+    if stderr.trim().is_empty() {
+        "the container runtime exited unsuccessfully".into()
+    } else {
+        format!("the container runtime reported: {stderr}")
+    }
+}
+
+fn runtime_program_display(program: &str) -> &str {
+    match program {
+        "podman" => "Podman",
+        "container" => "Apple Container CLI",
+        _ => program,
     }
 }
 

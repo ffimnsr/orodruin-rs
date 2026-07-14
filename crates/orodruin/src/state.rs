@@ -1,7 +1,8 @@
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContainerSummary {
     pub id: String,
     pub name: Option<String>,

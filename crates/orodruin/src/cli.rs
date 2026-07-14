@@ -15,27 +15,57 @@ use crate::backend::ContainerRuntime;
 pub struct Cli {
     #[arg(long, global = true, action = ArgAction::SetTrue, help = "Enable debug logging")]
     pub debug: bool,
+    #[arg(long, short = 'y', global = true, action = ArgAction::SetTrue, help = "Automatically answer yes to interactive prompts")]
+    pub yes: bool,
     #[arg(long, global = true, help = "Path to the orodruin config file")]
     pub config: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Commands,
 }
 
-#[derive(Debug, Parser, PartialEq, Eq)]
-#[command(
-    name = "orodruin",
-    version = crate::build_info::VERSION,
-    long_version = crate::build_info::LONG_VERSION,
-    about
-)]
-pub struct CompletionCli {
-    #[arg(long, global = true, action = ArgAction::SetTrue, help = "Enable debug logging")]
-    pub debug: bool,
-    #[arg(long, global = true, help = "Path to the orodruin config file")]
-    pub config: Option<PathBuf>,
-    #[command(subcommand)]
-    pub command: CompletionCommands,
+struct UnsupportedCommand {
+    path: &'static [&'static str],
+    hidden_name: &'static str,
 }
+
+const PODMAN_UNSUPPORTED_COMMANDS: &[UnsupportedCommand] = &[
+    UnsupportedCommand {
+        path: &["registry", "list"],
+        hidden_name: "__hidden__registry__list",
+    },
+    UnsupportedCommand {
+        path: &["builder", "start"],
+        hidden_name: "__hidden__builder__start",
+    },
+    UnsupportedCommand {
+        path: &["builder", "stop"],
+        hidden_name: "__hidden__builder__stop",
+    },
+    UnsupportedCommand {
+        path: &["system", "dns"],
+        hidden_name: "__hidden__system__dns",
+    },
+    UnsupportedCommand {
+        path: &["system", "kernel"],
+        hidden_name: "__hidden__system__kernel",
+    },
+    UnsupportedCommand {
+        path: &["system", "property"],
+        hidden_name: "__hidden__system__property",
+    },
+    UnsupportedCommand {
+        path: &["system", "start"],
+        hidden_name: "__hidden__system__start",
+    },
+    UnsupportedCommand {
+        path: &["system", "stop"],
+        hidden_name: "__hidden__system__stop",
+    },
+    UnsupportedCommand {
+        path: &["machine", "set-default"],
+        hidden_name: "__hidden__machine__set_default",
+    },
+];
 
 impl Cli {
     pub fn parse_for_runtime<I, T>(args: I, runtime: ContainerRuntime) -> Result<Self, clap::Error>
@@ -55,8 +85,8 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let matches =
-            Self::command_for_runtime_named(runtime, program_name).try_get_matches_from(args)?;
+        let matches = Self::parsing_command_for_runtime_named(runtime, program_name)
+            .try_get_matches_from(args)?;
         Self::from_arg_matches(&matches)
     }
 
@@ -65,27 +95,15 @@ impl Cli {
     }
 
     pub fn command_for_runtime_named(runtime: ContainerRuntime, program_name: &str) -> Command {
-        prune_command_for_runtime(
-            Self::command().bin_name(program_name.to_string()),
-            runtime,
-            &[],
-            "orodruin",
-        )
-    }
-}
-
-impl CompletionCli {
-    pub fn command_for_runtime(runtime: ContainerRuntime) -> Command {
-        Self::command_for_runtime_named(runtime, "orodruin")
+        prune_command_for_runtime(Self::base_command_named(program_name), runtime, &[])
     }
 
-    pub fn command_for_runtime_named(runtime: ContainerRuntime, program_name: &str) -> Command {
-        prune_command_for_runtime(
-            Self::command().bin_name(program_name.to_string()),
-            runtime,
-            &[],
-            "orodruin",
-        )
+    fn parsing_command_for_runtime_named(runtime: ContainerRuntime, program_name: &str) -> Command {
+        hide_unsupported_commands_for_runtime(Self::base_command_named(program_name), runtime, &[])
+    }
+
+    fn base_command_named(program_name: &str) -> Command {
+        Self::command().bin_name(program_name)
     }
 }
 
@@ -93,121 +111,48 @@ fn prune_command_for_runtime(
     command: Command,
     runtime: ContainerRuntime,
     parent_path: &[String],
-    root_name: &str,
 ) -> Command {
-    let name = command.get_name().to_string();
     let mut path = parent_path.to_vec();
-    path.push(name);
+    path.push(command.get_name().to_string());
 
-    if !command_path_supported(runtime, &path, root_name) {
-        return hide_command_path(command, &path, root_name);
+    if let Some(unsupported) = unsupported_command(runtime, &path) {
+        return command
+            .name(unsupported.hidden_name)
+            .aliases(Vec::<&str>::new())
+            .visible_aliases(Vec::<&str>::new())
+            .hide(true);
     }
 
-    command.mut_subcommands(|child| prune_command_for_runtime(child, runtime, &path, root_name))
+    command.mut_subcommands(|child| prune_command_for_runtime(child, runtime, &path))
 }
 
-fn command_path_supported(runtime: ContainerRuntime, path: &[String], root_name: &str) -> bool {
+fn hide_unsupported_commands_for_runtime(
+    command: Command,
+    runtime: ContainerRuntime,
+    parent_path: &[String],
+) -> Command {
+    let mut path = parent_path.to_vec();
+    path.push(command.get_name().to_string());
+
+    if unsupported_command(runtime, &path).is_some() {
+        return command.hide(true);
+    }
+
+    command.mut_subcommands(|child| hide_unsupported_commands_for_runtime(child, runtime, &path))
+}
+
+fn unsupported_command(
+    runtime: ContainerRuntime,
+    path: &[String],
+) -> Option<&'static UnsupportedCommand> {
     if runtime == ContainerRuntime::AppleContainer {
-        return true;
+        return None;
     }
 
-    let path = path.iter().map(String::as_str).collect::<Vec<_>>();
-    !is_hidden_path(path.as_slice(), root_name)
-}
-
-fn hide_command_path(command: Command, path: &[String], root_name: &str) -> Command {
-    let hidden_name = if path
+    let relative_path = path.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
+    PODMAN_UNSUPPORTED_COMMANDS
         .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "registry", "list"]
-    {
-        "__hidden__registry__list"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "builder", "start"]
-    {
-        "__hidden__builder__start"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "builder", "stop"]
-    {
-        "__hidden__builder__stop"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "system", "dns"]
-    {
-        "__hidden__system__dns"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "system", "kernel"]
-    {
-        "__hidden__system__kernel"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "system", "property"]
-    {
-        "__hidden__system__property"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "system", "start"]
-    {
-        "__hidden__system__start"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "system", "stop"]
-    {
-        "__hidden__system__stop"
-    } else if path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-        == [root_name, "machine", "set-default"]
-    {
-        "__hidden__machine__set_default"
-    } else {
-        "__hidden__unsupported"
-    };
-    command
-        .name(hidden_name)
-        .aliases(Vec::<&str>::new())
-        .visible_aliases(Vec::<&str>::new())
-        .hide(true)
-}
-
-fn is_hidden_path(path: &[&str], root_name: &str) -> bool {
-    path == [root_name, "registry", "list"]
-        || path == [root_name, "builder", "start"]
-        || path == [root_name, "builder", "stop"]
-        || path == [root_name, "system", "dns"]
-        || path == [root_name, "system", "kernel"]
-        || path == [root_name, "system", "property"]
-        || path == [root_name, "system", "start"]
-        || path == [root_name, "system", "stop"]
-        || path == [root_name, "machine", "set-default"]
+        .find(|command| command.path == relative_path.as_slice())
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -218,102 +163,14 @@ pub enum Commands {
     Create(EnvironmentName),
     #[command(about = "Open an interactive shell inside an environment container")]
     Enter(EnterCommand),
-    #[command(
-        about = "SSH to an environment using the container network address",
-        hide = true
-    )]
-    Ssh(SshCommand),
     #[command(about = "Run a command in an environment container")]
     Run(RunCommand),
     #[command(about = "List configured environments and their container state")]
-    List,
+    List(ListCommand),
     #[command(about = "Remove an environment container")]
     Rm(EnvironmentName),
     #[command(about = "Show the resolved configuration and container details for an environment")]
-    Inspect(EnvironmentName),
-    #[command(about = "Pull an image with the configured container runtime")]
-    Pull(RequiredPassthroughArgs),
-    #[command(about = "List local images with the configured container runtime")]
-    Images(OptionalPassthroughArgs),
-    #[command(about = "Remove an image with the configured container runtime")]
-    Rmi(RequiredPassthroughArgs),
-    #[command(about = "List containers with the configured container runtime")]
-    Ps(OptionalPassthroughArgs),
-    #[command(about = "Show container logs with the configured container runtime")]
-    Logs(OptionalPassthroughArgs),
-    #[command(about = "Build an image with the configured container runtime")]
-    Build(RequiredPassthroughArgs),
-    #[command(
-        about = "Copy files with the configured container runtime",
-        visible_alias = "cp"
-    )]
-    Copy(RequiredPassthroughArgs),
-    #[command(about = "Log in to a registry with the configured container runtime")]
-    Login(OptionalPassthroughArgs),
-    #[command(about = "Log out from a registry with the configured container runtime")]
-    Logout(OptionalPassthroughArgs),
-    #[command(
-        subcommand,
-        about = "Run image commands with the configured container runtime"
-    )]
-    Image(ImageCommands),
-    #[command(
-        subcommand,
-        about = "Run container commands with the configured container runtime"
-    )]
-    Container(ContainerCommands),
-    #[command(
-        subcommand,
-        about = "Run registry commands with the configured container runtime"
-    )]
-    Registry(RegistryCommands),
-    #[command(
-        subcommand,
-        about = "Run volume commands with the configured container runtime"
-    )]
-    Volume(ResourceCommands),
-    #[command(
-        subcommand,
-        about = "Run network commands with the configured container runtime"
-    )]
-    Network(ResourceCommands),
-    #[command(
-        subcommand,
-        about = "Run builder commands with the configured container runtime"
-    )]
-    Builder(BuilderCommands),
-    #[command(
-        subcommand,
-        about = "Run system commands with the configured container runtime"
-    )]
-    System(SystemCommands),
-    #[command(
-        subcommand,
-        about = "Run machine commands with the configured container runtime"
-    )]
-    Machine(MachineCommands),
-    #[command(about = "Generate shell completion scripts")]
-    Completions(CompletionsCommand),
-    #[command(about = "Show version, commit, date, and build information")]
-    Version,
-}
-
-#[derive(Debug, Subcommand, PartialEq, Eq)]
-pub enum CompletionCommands {
-    #[command(about = "Create a starter orodruin.toml in the current directory")]
-    Init,
-    #[command(about = "Create the container for an environment and start it if needed")]
-    Create(EnvironmentName),
-    #[command(about = "Open an interactive shell inside an environment container")]
-    Enter(EnterCommand),
-    #[command(about = "Run a command in an environment container")]
-    Run(RunCommand),
-    #[command(about = "List configured environments and their container state")]
-    List,
-    #[command(about = "Remove an environment container")]
-    Rm(EnvironmentName),
-    #[command(about = "Show the resolved configuration and container details for an environment")]
-    Inspect(EnvironmentName),
+    Inspect(InspectCommand),
     #[command(about = "Pull an image with the configured container runtime")]
     Pull(RequiredPassthroughArgs),
     #[command(about = "List local images with the configured container runtime")]
@@ -394,21 +251,25 @@ pub struct EnvironmentName {
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct ListCommand {
+    #[arg(long, action = ArgAction::SetTrue, help = "Print structured JSON output")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct InspectCommand {
+    #[arg(help = "Environment name from orodruin.toml")]
+    pub env: String,
+    #[arg(long, action = ArgAction::SetTrue, help = "Print structured JSON output")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
 pub struct EnterCommand {
     #[arg(
         help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment"
     )]
     pub env: Option<String>,
-}
-
-#[derive(Debug, Args, Clone, PartialEq, Eq)]
-pub struct SshCommand {
-    #[arg(
-        help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment"
-    )]
-    pub env: Option<String>,
-    #[arg(long, action = ArgAction::SetTrue, help = "Print the ssh command instead of executing it")]
-    pub print: bool,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -706,6 +567,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_global_yes_and_list_json() {
+        let cli = Cli::parse_from(["orodruin", "--yes", "list", "--json"]);
+        assert!(cli.yes);
+        assert_eq!(cli.command, Commands::List(ListCommand { json: true }));
+    }
+
+    #[test]
+    fn parses_inspect_json() {
+        let cli = Cli::parse_from(["orodruin", "inspect", "dev", "--json"]);
+        assert_eq!(
+            cli.command,
+            Commands::Inspect(InspectCommand {
+                env: "dev".into(),
+                json: true,
+            })
+        );
+    }
+
+    #[test]
     fn parses_run_without_environment() {
         let cli = Cli::parse_from(["orodruin", "run"]);
         assert_eq!(
@@ -750,37 +630,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_ssh_without_environment() {
-        let cli = Cli::parse_from(["orodruin", "ssh", "--print"]);
-        assert_eq!(
-            cli.command,
-            Commands::Ssh(SshCommand {
-                env: None,
-                print: true,
-            })
-        );
-
-        let cli = Cli::parse_from(["orodruin", "ssh", "dev"]);
-        assert_eq!(
-            cli.command,
-            Commands::Ssh(SshCommand {
-                env: Some("dev".into()),
-                print: false,
-            })
-        );
-    }
-
-    #[test]
-    fn ssh_subcommand_hidden_from_help() {
-        let mut command = Cli::command();
-        let mut buffer = Vec::new();
-        command.write_long_help(&mut buffer).unwrap();
-        let help = String::from_utf8(buffer).unwrap();
-
-        assert!(!help.contains("ssh"));
-    }
-
-    #[test]
     fn podman_runtime_prunes_unsupported_subcommands() {
         let command = Cli::command_for_runtime(ContainerRuntime::Podman);
         let registry = command.find_subcommand("registry").unwrap();
@@ -806,16 +655,24 @@ mod tests {
     }
 
     #[test]
-    fn podman_runtime_rejects_pruned_subcommands() {
-        let error = Cli::parse_for_runtime(["orodruin", "system", "dns"], ContainerRuntime::Podman)
-            .unwrap_err();
+    fn podman_runtime_parses_hidden_unsupported_subcommands() {
+        let cli = Cli::parse_for_runtime(["orodruin", "system", "dns"], ContainerRuntime::Podman)
+            .unwrap();
+        assert_eq!(
+            cli.command,
+            Commands::System(SystemCommands::Dns(OptionalPassthroughArgs {
+                args: vec![]
+            }))
+        );
 
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
-
-        let error =
+        let cli =
             Cli::parse_for_runtime(["orodruin", "registry", "list"], ContainerRuntime::Podman)
-                .unwrap_err();
-
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+                .unwrap();
+        assert_eq!(
+            cli.command,
+            Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
+                args: vec![]
+            }))
+        );
     }
 }

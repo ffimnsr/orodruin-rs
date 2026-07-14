@@ -49,7 +49,7 @@ The compiled binaries will be available at `target/release/orodruin` and `target
 Run the library tests while you are here:
 
 ```sh
-cargo test -p orodruin --lib
+cargo test -p orodruin-cli --lib
 ```
 
 ## Quick Start
@@ -139,6 +139,12 @@ Examples:
 | `orodruin list` | Show configured environments and container state | `orodruin list` |
 | `orodruin rm <env>` | Remove an environment container | `orodruin rm dev` |
 | `orodruin inspect <env>` | Show the resolved config and container details | `orodruin inspect dev` |
+
+Notes:
+
+- `list --json` prints structured JSON for scripting.
+- `inspect <env> --json` prints the resolved environment and container inspect payload as JSON.
+- Global `--yes` auto-approves prompts such as starting the Apple container system.
 
 Notes:
 
@@ -241,8 +247,54 @@ Some backend commands are only available on one platform:
 ```sh
 orodruin --help
 orodruin --debug list
+orodruin list --json
+orodruin inspect dev --json
+orodruin --yes enter dev
 orodruin completions bash
 orodruin version
+```
+
+## Using with LLM Coding Agents
+
+If you use `orodruin` with agent instruction files such as `AGENTS.md`, `SKILLS.md`, or other repository-specific guidance, tell the agent to run project commands inside the environment container instead of on the host.
+
+A good default instruction looks like this:
+
+```md
+## Container Execution
+
+This repository uses `orodruin` for its development environment.
+
+- Run project commands inside the container, not on the host.
+- Prefer `orodruin run <env> -- <command>` for one-off commands.
+- Prefer `orodruin enter <env>` only when an interactive shell is explicitly needed.
+- If `project.default_env` is configured, you may omit `<env>` when appropriate, but using the explicit environment name is preferred in automation.
+- Before running project-specific commands, make sure the environment exists by running `orodruin create <env>` if needed.
+
+Examples:
+
+- `orodruin run dev -- cargo test`
+- `orodruin run dev -- cargo fmt --check`
+- `orodruin run dev -- python -m pytest`
+- `orodruin run dev -- bash -lc 'pwd && ls -la'`
+```
+
+For most agents, the simplest rule is:
+
+- do not run `cargo`, `python`, `npm`, `go`, or other project tools directly on the host when they are intended to run inside the container
+- instead, wrap them with `orodruin run <env> -- ...`
+
+If your repository has a default environment, you can also use shorter forms such as:
+
+```sh
+orodruin run -- cargo test
+orodruin run -- cargo clippy
+```
+
+If you want the agent to be extra safe, add a note like this too:
+
+```md
+If a command fails because the environment container does not exist yet, run `orodruin create dev` first and retry the command inside the container.
 ```
 
 ## Development
@@ -251,8 +303,8 @@ Useful commands while iterating locally:
 
 ```sh
 cargo fmt
-cargo test -p orodruin --lib
-cargo run -p orodruin -- --help
+cargo test -p orodruin-cli --lib
+cargo run -p orodruin-cli -- --help
 ```
 
 ## License
