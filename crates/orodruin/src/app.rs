@@ -105,10 +105,7 @@ fn run_with_backend_for_runtime(
         }
         Commands::Run(run) => {
             let loaded = load_config(cli.config.as_deref())?;
-            let environment = EnvironmentName {
-                env: run.env.clone(),
-            };
-            let resolved = resolve_environment(&loaded, &environment)?;
+            let resolved = resolve_optional_environment(&loaded, run.env.as_deref(), "run")?;
             materialize_environment_for_runtime(backend, runtime, &resolved)?;
             let command = resolve_run_command(&resolved, run)?;
             ensure_container_user(backend, &resolved)?;
@@ -1959,7 +1956,49 @@ mod tests {
             debug: false,
             config: None,
             command: Commands::Run(RunCommand {
-                env: "ci".into(),
+                env: Some("ci".into()),
+                command: vec![],
+            }),
+        };
+
+        run_with_backend(cli, &backend).unwrap();
+        assert_eq!(
+            backend.execs.borrow()[1].command,
+            vec![String::from("cargo"), String::from("test")]
+        );
+        assert_eq!(backend.builds.borrow()[0], "demo-ci:dev");
+    }
+
+    #[test]
+    fn run_uses_default_environment_when_not_provided() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+                default_env = "ci"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+                shell = ["/bin/bash"]
+                startup_command = ["sleep", "infinity"]
+
+                [envs.ci]
+                build = { context = ".", file = "Containerfile", tag = "demo-ci:dev" }
+                default_command = ["cargo", "test"]
+            "#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let backend = MockBackend::with_lists(vec![vec![]]);
+
+        let cli = Cli {
+            debug: false,
+            config: None,
+            command: Commands::Run(RunCommand {
+                env: None,
                 command: vec![],
             }),
         };

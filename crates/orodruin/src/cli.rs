@@ -413,8 +413,10 @@ pub struct SshCommand {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct RunCommand {
-    #[arg(help = "Environment name from orodruin.toml")]
-    pub env: String,
+    #[arg(
+        help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment"
+    )]
+    pub env: Option<String>,
     #[arg(
         last = true,
         help = "Command to execute after `--`; uses the environment default if omitted"
@@ -700,6 +702,36 @@ mod tests {
         assert_eq!(
             cli.command,
             Commands::Completions(CompletionsCommand { shell: Shell::Zsh })
+        );
+    }
+
+    #[test]
+    fn parses_run_without_environment() {
+        let cli = Cli::parse_from(["orodruin", "run"]);
+        assert_eq!(
+            cli.command,
+            Commands::Run(RunCommand {
+                env: None,
+                command: vec![],
+            })
+        );
+
+        let cli = Cli::parse_from(["orodruin", "run", "dev"]);
+        assert_eq!(
+            cli.command,
+            Commands::Run(RunCommand {
+                env: Some("dev".into()),
+                command: vec![],
+            })
+        );
+
+        let cli = Cli::parse_from(["orodruin", "run", "dev", "--", "date"]);
+        assert_eq!(
+            cli.command,
+            Commands::Run(RunCommand {
+                env: Some("dev".into()),
+                command: vec!["date".into()],
+            })
         );
     }
 

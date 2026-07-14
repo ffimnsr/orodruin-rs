@@ -14,6 +14,7 @@ exclude = [
   ".gitignore"
 ]
 autobins = false
+default-run = "orodruin"
 
 [[bin]]
 name = "orodruin"
