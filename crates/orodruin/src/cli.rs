@@ -1,9 +1,9 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use clap::{ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::Shell;
 
-use crate::backend::ContainerRuntime;
+use crate::{backend::ContainerRuntime, config::parse_timeout};
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -17,6 +17,8 @@ pub struct Cli {
     pub debug: bool,
     #[arg(long, short = 'y', global = true, action = ArgAction::SetTrue, help = "Automatically answer yes to interactive prompts")]
     pub yes: bool,
+    #[arg(long, global = true, value_parser = parse_timeout, help = "Maximum runtime per subprocess, for example `30`, `500ms`, `30s`, `2m`, or `1h`")]
+    pub timeout: Option<Duration>,
     #[arg(long, global = true, help = "Path to the orodruin config file")]
     pub config: Option<PathBuf>,
     #[command(subcommand)]
@@ -171,6 +173,8 @@ pub enum Commands {
     Rm(EnvironmentName),
     #[command(about = "Show the resolved configuration and container details for an environment")]
     Inspect(InspectCommand),
+    #[command(about = "Check config, runtime availability, and environment readiness")]
+    Doctor(DoctorCommand),
     #[command(about = "Pull an image with the configured container runtime")]
     Pull(RequiredPassthroughArgs),
     #[command(about = "List local images with the configured container runtime")]
@@ -260,6 +264,12 @@ pub struct ListCommand {
 pub struct InspectCommand {
     #[arg(help = "Environment name from orodruin.toml")]
     pub env: String,
+    #[arg(long, action = ArgAction::SetTrue, help = "Print structured JSON output")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct DoctorCommand {
     #[arg(long, action = ArgAction::SetTrue, help = "Print structured JSON output")]
     pub json: bool,
 }
@@ -583,6 +593,25 @@ mod tests {
                 json: true,
             })
         );
+    }
+
+    #[test]
+    fn parses_doctor_json() {
+        let cli = Cli::parse_from(["orodruin", "doctor", "--json"]);
+        assert_eq!(cli.command, Commands::Doctor(DoctorCommand { json: true }));
+    }
+
+    #[test]
+    fn parses_global_timeout() {
+        let cli = Cli::parse_from(["orodruin", "--timeout", "1500ms", "doctor"]);
+        assert_eq!(cli.timeout, Some(Duration::from_millis(1500)));
+        assert_eq!(cli.command, Commands::Doctor(DoctorCommand { json: false }));
+    }
+
+    #[test]
+    fn rejects_invalid_timeout_unit() {
+        let error = Cli::try_parse_from(["orodruin", "--timeout", "3d", "doctor"]).unwrap_err();
+        assert!(error.to_string().contains("invalid duration unit"));
     }
 
     #[test]

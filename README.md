@@ -12,7 +12,7 @@ The same `orodruin` commands work on both platforms, but a few backend-only subc
 ## What You Can Do
 
 - Create a starter config with `orodruin init`
-- Build, create, enter, inspect, and remove environment containers
+- Build, create, enter, inspect, diagnose, and remove environment containers
 - Run commands inside an environment with `orodruin run`
 - Forward common container, image, registry, volume, network, builder, system, and machine commands to the active runtime
 - Generate shell completions and print build/version info
@@ -70,9 +70,11 @@ Here is a minimal example with one image-based environment and one build-based e
 [project]
 name = "demo"
 default_env = "dev"
+default_timeout = "30m"
 
 [envs.dev]
 image = "ubuntu:latest"
+timeout = "10m"
 project_mount = "/workspace/demo"
 workdir = "/workspace/demo"
 shell = ["/bin/bash"]
@@ -110,6 +112,9 @@ orodruin run dev -- bash -lc 'pwd && id'
 - The config must define at least one environment under `[envs.<name>]`.
 - Every environment must define exactly one of `image` or `build`.
 - Use `project.default_env` when you want `enter` to work without explicitly naming an environment.
+- Use `project.default_timeout` to set default subprocess timeout for config-driven commands.
+- Use `envs.<name>.timeout` to override timeout for specific environment commands.
+- CLI `--timeout` overrides both config timeout settings.
 
 ## Runtime Selection
 
@@ -139,11 +144,14 @@ Examples:
 | `orodruin list` | Show configured environments and container state | `orodruin list` |
 | `orodruin rm <env>` | Remove an environment container | `orodruin rm dev` |
 | `orodruin inspect <env>` | Show the resolved config and container details | `orodruin inspect dev` |
+| `orodruin doctor` | Check config, runtime availability, and environment readiness | `orodruin doctor` |
 
 Notes:
 
 - `list --json` prints structured JSON for scripting.
 - `inspect <env> --json` prints the resolved environment and container inspect payload as JSON.
+- `doctor --json` prints structured health checks for scripting and CI.
+- Global `--timeout <duration>` limits each spawned runtime command, for example `--timeout 30s`.
 - Global `--yes` auto-approves prompts such as starting the Apple container system.
 
 Notes:
@@ -249,6 +257,9 @@ orodruin --help
 orodruin --debug list
 orodruin list --json
 orodruin inspect dev --json
+orodruin doctor
+orodruin doctor --json
+orodruin --timeout 30s run dev -- cargo test
 orodruin --yes enter dev
 orodruin completions bash
 orodruin version

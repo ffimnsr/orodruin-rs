@@ -1,8 +1,10 @@
 use std::{
+    env,
     ffi::OsString,
     fs,
     io::{self, BufRead, Write},
     path::Path,
+    time::Duration,
 };
 
 use clap_complete::generate;
@@ -12,11 +14,14 @@ use serde_json::{Value, to_string_pretty};
 use crate::{
     backend::{BackendError, ContainerBackend, ContainerCliBackend, ContainerRuntime, ExecRequest},
     cli::{
-        BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, EnvironmentName,
-        ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
+        BuilderCommands, Cli, Commands, CompletionsCommand, ContainerCommands, DoctorCommand,
+        EnvironmentName, ImageCommands, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
         RequiredPassthroughArgs, ResourceCommands, RunCommand, SystemCommands,
     },
-    config::{CONFIG_FILE_NAME, LoadedConfig, ProjectConfig, default_init_config},
+    config::{
+        CONFIG_FILE_NAME, ConfigError, LoadedConfig, ProjectConfig, default_init_config,
+        parse_timeout,
+    },
     env_model::{ResolvedEnvironment, ResolvedUser},
     error::OrodruinError,
     state::ContainerSummary,
@@ -48,6 +53,33 @@ struct InspectReport<'a> {
     inspect: Option<Value>,
 }
 
+#[derive(Debug, Serialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorEnvironmentReport {
+    env: String,
+    container: String,
+    image: String,
+    healthy: bool,
+    checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    healthy: bool,
+    runtime: String,
+    runtime_program: String,
+    config_path: Option<String>,
+    project_root: Option<String>,
+    checks: Vec<DoctorCheck>,
+    environments: Vec<DoctorEnvironmentReport>,
+}
+
 pub fn run<I, T>(args: I) -> Result<(), OrodruinError>
 where
     I: IntoIterator<Item = T>,
@@ -63,7 +95,8 @@ where
     let runtime = runtime_for_os(std::env::consts::OS)?;
     let cli = Cli::parse_for_runtime_named(args, runtime, &program_name)
         .unwrap_or_else(|error| error.exit());
-    let backend = ContainerCliBackend::new(cli.debug, runtime);
+    let timeout = configured_timeout_for_cli(&cli)?;
+    let backend = ContainerCliBackend::new(cli.debug, runtime, timeout);
     run_with_backend_for_runtime(cli, &backend, runtime)
 }
 
@@ -161,6 +194,9 @@ fn run_with_backend_for_runtime(
             } else {
                 print_inspect_report(&report);
             }
+        }
+        Commands::Doctor(command) => {
+            doctor_command(backend, runtime, cli.config.as_deref(), command)?
         }
         Commands::Pull(args) => {
             run_passthrough(backend, runtime, pull_passthrough(runtime, args), prompt)?
@@ -984,6 +1020,99 @@ fn unsupported_with_podman(command: &str, reason: &str) -> OrodruinError {
     ))
 }
 
+fn doctor_check(name: impl Into<String>, ok: bool, detail: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name: name.into(),
+        ok,
+        detail: detail.into(),
+    }
+}
+
+fn doctor_environment_report(
+    project_root: &Path,
+    project: &ProjectConfig,
+    env_name: &str,
+    config: &crate::config::EnvironmentConfig,
+) -> DoctorEnvironmentReport {
+    let resolved = ResolvedEnvironment::resolve(project_root, project, env_name, config);
+    let mut checks = vec![doctor_check(
+        "project root mount",
+        resolved.project_root.exists(),
+        format!("host path {}", resolved.project_root.display()),
+    )];
+
+    if let Some(build) = &resolved.build {
+        checks.push(doctor_check(
+            "build context",
+            build.context.exists(),
+            format!("{}", build.context.display()),
+        ));
+        if let Some(file) = &build.file {
+            checks.push(doctor_check(
+                "build file",
+                file.exists(),
+                format!("{}", file.display()),
+            ));
+        }
+    }
+
+    for mount in &resolved.mounts[1..] {
+        checks.push(doctor_check(
+            format!("mount {}", mount.target),
+            mount.source.exists(),
+            format!("host path {}", mount.source.display()),
+        ));
+    }
+
+    for key in &config.preserve_env {
+        let present = env::var_os(key).is_some();
+        checks.push(doctor_check(
+            format!("preserve env {key}"),
+            present,
+            if present {
+                String::from("available in host environment")
+            } else {
+                String::from("missing from host environment")
+            },
+        ));
+    }
+
+    let healthy = checks.iter().all(|check| check.ok);
+    DoctorEnvironmentReport {
+        env: env_name.to_string(),
+        container: resolved.container_name,
+        image: resolved.image,
+        healthy,
+        checks,
+    }
+}
+
+fn runtime_name(runtime: ContainerRuntime) -> &'static str {
+    match runtime {
+        ContainerRuntime::AppleContainer => "apple-container",
+        ContainerRuntime::Podman => "podman",
+    }
+}
+
+fn runtime_program_display(runtime: ContainerRuntime) -> &'static str {
+    match runtime {
+        ContainerRuntime::AppleContainer => "Apple Container CLI",
+        ContainerRuntime::Podman => "Podman",
+    }
+}
+
+fn runtime_program_available(program: &str) -> bool {
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+
+    env::split_paths(&paths).any(|directory| executable_exists(&directory.join(program)))
+}
+
+fn executable_exists(path: &Path) -> bool {
+    path.is_file()
+}
+
 impl From<OptionalPassthroughArgs> for Vec<String> {
     fn from(value: OptionalPassthroughArgs) -> Self {
         value.args
@@ -993,6 +1122,51 @@ impl From<OptionalPassthroughArgs> for Vec<String> {
 impl From<RequiredPassthroughArgs> for Vec<String> {
     fn from(value: RequiredPassthroughArgs) -> Self {
         value.args
+    }
+}
+
+fn print_doctor_report(report: &DoctorReport) {
+    println!(
+        "doctor: {}",
+        if report.healthy {
+            "ok"
+        } else {
+            "problems found"
+        }
+    );
+    println!("runtime: {} ({})", report.runtime, report.runtime_program);
+    if let Some(config_path) = &report.config_path {
+        println!("config: {}", config_path);
+    }
+    if let Some(project_root) = &report.project_root {
+        println!("project root: {}", project_root);
+    }
+
+    for check in &report.checks {
+        println!(
+            "check {}: {} ({})",
+            check.name,
+            if check.ok { "ok" } else { "fail" },
+            check.detail
+        );
+    }
+
+    for environment in &report.environments {
+        println!(
+            "env {}: {} [{}]",
+            environment.env,
+            if environment.healthy { "ok" } else { "fail" },
+            environment.container
+        );
+        println!("  image: {}", environment.image);
+        for check in &environment.checks {
+            println!(
+                "  check {}: {} ({})",
+                check.name,
+                if check.ok { "ok" } else { "fail" },
+                check.detail
+            );
+        }
     }
 }
 
@@ -1039,6 +1213,189 @@ fn init_command() -> Result<(), OrodruinError> {
 fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, OrodruinError> {
     let cwd = std::env::current_dir()?;
     Ok(ProjectConfig::load_from(&cwd, explicit_path)?)
+}
+
+fn configured_timeout_for_cli(cli: &Cli) -> Result<Option<Duration>, OrodruinError> {
+    if let Some(timeout) = cli.timeout {
+        return Ok(Some(timeout));
+    }
+
+    let loaded = match &cli.command {
+        Commands::Create(_)
+        | Commands::Enter(_)
+        | Commands::Run(_)
+        | Commands::List(_)
+        | Commands::Rm(_)
+        | Commands::Inspect(_)
+        | Commands::Doctor(_) => Some(load_config(cli.config.as_deref())?),
+        Commands::Init | Commands::Completions(_) | Commands::Version => None,
+        _ => try_load_config(cli.config.as_deref())?,
+    };
+
+    let Some(loaded) = loaded else {
+        return Ok(None);
+    };
+
+    let configured = match &cli.command {
+        Commands::Create(environment) | Commands::Rm(environment) => {
+            resolve_environment(&loaded, environment)?.timeout
+        }
+        Commands::Inspect(command) => resolve_environment_by_name(&loaded, &command.env)?.timeout,
+        Commands::Enter(command) => {
+            resolve_optional_environment(&loaded, command.env.as_deref(), "enter")?.timeout
+        }
+        Commands::Run(command) => {
+            resolve_optional_environment(&loaded, command.env.as_deref(), "run")?.timeout
+        }
+        Commands::List(_)
+        | Commands::Doctor(_)
+        | Commands::Pull(_)
+        | Commands::Images(_)
+        | Commands::Rmi(_)
+        | Commands::Ps(_)
+        | Commands::Logs(_)
+        | Commands::Build(_)
+        | Commands::Copy(_)
+        | Commands::Login(_)
+        | Commands::Logout(_)
+        | Commands::Image(_)
+        | Commands::Container(_)
+        | Commands::Registry(_)
+        | Commands::Volume(_)
+        | Commands::Network(_)
+        | Commands::Builder(_)
+        | Commands::System(_)
+        | Commands::Machine(_) => loaded.config.project.default_timeout.clone(),
+        Commands::Init | Commands::Completions(_) | Commands::Version => None,
+    };
+
+    configured
+        .as_deref()
+        .map(parse_timeout)
+        .transpose()
+        .map_err(OrodruinError::Message)
+}
+
+fn try_load_config(explicit_path: Option<&Path>) -> Result<Option<LoadedConfig>, OrodruinError> {
+    let cwd = std::env::current_dir()?;
+    match ProjectConfig::load_from(&cwd, explicit_path) {
+        Ok(loaded) => Ok(Some(loaded)),
+        Err(ConfigError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn doctor_command(
+    backend: &dyn ContainerBackend,
+    runtime: ContainerRuntime,
+    explicit_path: Option<&Path>,
+    command: DoctorCommand,
+) -> Result<(), OrodruinError> {
+    let report = doctor_report(backend, runtime, explicit_path)?;
+    if command.json {
+        print_json(&report)?;
+    } else {
+        print_doctor_report(&report);
+    }
+    if report.healthy {
+        Ok(())
+    } else {
+        Err(OrodruinError::Message("doctor found problems".into()))
+    }
+}
+
+fn doctor_report(
+    backend: &dyn ContainerBackend,
+    runtime: ContainerRuntime,
+    explicit_path: Option<&Path>,
+) -> Result<DoctorReport, OrodruinError> {
+    let cwd = std::env::current_dir()?;
+    let runtime_program = runtime.program().to_string();
+    let mut checks = vec![doctor_check(
+        "runtime binary",
+        runtime_program_available(&runtime_program),
+        format!("{} on PATH", runtime_program_display(runtime)),
+    )];
+    let config_path = match ProjectConfig::locate_path(&cwd, explicit_path) {
+        Ok(path) => path,
+        Err(error) => {
+            checks.push(doctor_check("config file", false, error.to_string()));
+            return Ok(DoctorReport {
+                healthy: false,
+                runtime: runtime_name(runtime).into(),
+                runtime_program,
+                config_path: None,
+                project_root: None,
+                checks,
+                environments: vec![],
+            });
+        }
+    };
+
+    let loaded = match ProjectConfig::load_path(&config_path) {
+        Ok(loaded) => {
+            checks.push(doctor_check(
+                "config file",
+                true,
+                format!("loaded {}", config_path.display()),
+            ));
+            loaded
+        }
+        Err(error) => {
+            checks.push(doctor_check("config file", false, error.to_string()));
+            return Ok(DoctorReport {
+                healthy: false,
+                runtime: runtime_name(runtime).into(),
+                runtime_program,
+                config_path: Some(config_path.display().to_string()),
+                project_root: config_path.parent().map(|path| path.display().to_string()),
+                checks,
+                environments: vec![],
+            });
+        }
+    };
+
+    let runtime_available = checks.first().map(|check| check.ok).unwrap_or(false);
+    if runtime.manages_system_lifecycle() {
+        let system_check = if runtime_available {
+            match backend.system_running() {
+                Ok(true) => doctor_check("container system", true, "running"),
+                Ok(false) => doctor_check(
+                    "container system",
+                    false,
+                    "not running; start with `container system start` or rerun commands with `--yes`",
+                ),
+                Err(error) => doctor_check("container system", false, error.to_string()),
+            }
+        } else {
+            doctor_check(
+                "container system",
+                false,
+                "runtime binary missing; cannot check container system state",
+            )
+        };
+        checks.push(system_check);
+    }
+
+    let environments = loaded
+        .config
+        .envs
+        .iter()
+        .map(|(name, config)| doctor_environment_report(&loaded.root, &loaded.config, name, config))
+        .collect::<Vec<_>>();
+
+    let healthy = checks.iter().all(|check| check.ok)
+        && environments.iter().all(|environment| environment.healthy);
+
+    Ok(DoctorReport {
+        healthy,
+        runtime: runtime_name(runtime).into(),
+        runtime_program,
+        config_path: Some(loaded.path.display().to_string()),
+        project_root: Some(loaded.root.display().to_string()),
+        checks,
+        environments,
+    })
 }
 
 fn resolve_environment(
@@ -1464,8 +1821,10 @@ mod tests {
     use std::{
         cell::RefCell,
         collections::VecDeque,
+        ffi::OsString,
         path::{Path, PathBuf},
         sync::{Mutex, MutexGuard},
+        time::Duration,
     };
 
     use serde_json::json;
@@ -1475,8 +1834,8 @@ mod tests {
         backend::{BackendError, CommandSpec},
         cli::{
             BuilderCommands, Commands, ContainerCommands, EnterCommand, ImageCommands,
-            InspectCommand, MachineCommands, OptionalPassthroughArgs, RegistryCommands,
-            ResourceCommands, SystemCommands,
+            InspectCommand, ListCommand, MachineCommands, OptionalPassthroughArgs,
+            RegistryCommands, ResourceCommands, SystemCommands,
         },
         config::{EnvironmentConfig, ProjectMetadata},
         env_model::ResolvedBuild,
@@ -1508,6 +1867,7 @@ mod tests {
     }
 
     static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
+    static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct CurrentDirGuard<'a> {
         _lock: MutexGuard<'a, ()>,
@@ -1531,6 +1891,43 @@ mod tests {
     impl Drop for CurrentDirGuard<'_> {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.previous).unwrap();
+        }
+    }
+
+    struct EnvVarGuard<'a> {
+        _lock: MutexGuard<'a, ()>,
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl<'a> EnvVarGuard<'a> {
+        fn set(name: &'static str, value: impl Into<OsString>) -> Self {
+            let lock = PROCESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous = std::env::var_os(name);
+            let value = value.into();
+            unsafe {
+                std::env::set_var(name, &value);
+            }
+            Self {
+                _lock: lock,
+                name,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard<'_> {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => unsafe {
+                    std::env::set_var(self.name, previous);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.name);
+                },
+            }
         }
     }
 
@@ -1626,6 +2023,10 @@ mod tests {
         ResolvedEnvironment::resolve(&loaded.root, &loaded.config, env_name, config).container_name
     }
 
+    fn write_runtime_stub(root: &Path, name: &str) {
+        fs::write(root.join(name), "#!/bin/sh\nexit 0\n").unwrap();
+    }
+
     #[test]
     fn create_is_idempotent_for_existing_running_container() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -1643,6 +2044,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Create(EnvironmentName { env: "dev".into() }),
         };
@@ -1669,6 +2071,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
@@ -1973,6 +2376,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
@@ -2003,6 +2407,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Rm(EnvironmentName { env: "dev".into() }),
         };
@@ -2022,6 +2427,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Run(RunCommand {
                 env: Some("ci".into()),
@@ -2065,6 +2471,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Run(RunCommand {
                 env: None,
@@ -2078,6 +2485,216 @@ mod tests {
             vec![String::from("cargo"), String::from("test")]
         );
         assert_eq!(backend.builds.borrow()[0], "demo-ci:dev");
+    }
+
+    #[test]
+    fn configured_timeout_prefers_cli_then_env_then_project() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+                default_env = "dev"
+                default_timeout = "45s"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+                timeout = "5s"
+
+                [envs.ci]
+                image = "ubuntu:latest"
+            "#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let env_cli = Cli {
+            debug: false,
+            yes: false,
+            timeout: None,
+            config: None,
+            command: Commands::Create(EnvironmentName { env: "dev".into() }),
+        };
+        assert_eq!(
+            configured_timeout_for_cli(&env_cli).unwrap(),
+            Some(Duration::from_secs(5))
+        );
+
+        let project_cli = Cli {
+            debug: false,
+            yes: false,
+            timeout: None,
+            config: None,
+            command: Commands::List(ListCommand { json: false }),
+        };
+        assert_eq!(
+            configured_timeout_for_cli(&project_cli).unwrap(),
+            Some(Duration::from_secs(45))
+        );
+
+        let override_cli = Cli {
+            debug: false,
+            yes: false,
+            timeout: Some(Duration::from_secs(2)),
+            config: None,
+            command: Commands::Enter(EnterCommand { env: None }),
+        };
+        assert_eq!(
+            configured_timeout_for_cli(&override_cli).unwrap(),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn passthrough_uses_project_timeout_when_config_present() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+                default_timeout = "12s"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+            "#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let cli = Cli {
+            debug: false,
+            yes: false,
+            timeout: None,
+            config: None,
+            command: Commands::Pull(RequiredPassthroughArgs {
+                args: vec!["alpine:latest".into()],
+            }),
+        };
+        assert_eq!(
+            configured_timeout_for_cli(&cli).unwrap(),
+            Some(Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn passthrough_skips_timeout_when_config_missing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let _guard = CurrentDirGuard::enter(tempdir.path());
+
+        let cli = Cli {
+            debug: false,
+            yes: false,
+            timeout: None,
+            config: None,
+            command: Commands::Ps(OptionalPassthroughArgs { args: vec![] }),
+        };
+        assert_eq!(configured_timeout_for_cli(&cli).unwrap(), None);
+    }
+
+    #[test]
+    fn doctor_environment_reports_missing_inputs() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+                preserve_env = ["MISSING_DOCTOR_ENV"]
+
+                [envs.ci]
+                build = { context = ".", file = "Containerfile", tag = "demo-ci:dev" }
+            "#,
+        )
+        .unwrap();
+
+        let loaded =
+            ProjectConfig::load_from(tempdir.path(), Some(&tempdir.path().join(CONFIG_FILE_NAME)))
+                .unwrap();
+        let dev = doctor_environment_report(
+            &loaded.root,
+            &loaded.config,
+            "dev",
+            loaded.config.envs.get("dev").unwrap(),
+        );
+        let ci = doctor_environment_report(
+            &loaded.root,
+            &loaded.config,
+            "ci",
+            loaded.config.envs.get("ci").unwrap(),
+        );
+
+        assert!(!dev.healthy);
+        assert!(
+            dev.checks
+                .iter()
+                .any(|check| check.name == "preserve env MISSING_DOCTOR_ENV" && !check.ok)
+        );
+        assert!(!ci.healthy);
+        assert!(
+            ci.checks
+                .iter()
+                .any(|check| check.name == "build file" && !check.ok)
+        );
+    }
+
+    #[test]
+    fn doctor_report_marks_missing_runtime_binary() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_config(tempdir.path());
+        fs::write(tempdir.path().join("Containerfile"), "FROM ubuntu:latest\n").unwrap();
+        let _cwd = CurrentDirGuard::enter(tempdir.path());
+        let _path = EnvVarGuard::set("PATH", tempdir.path().join("bin-missing"));
+
+        let backend = MockBackend::default();
+        let report = doctor_report(&backend, ContainerRuntime::Podman, None).unwrap();
+
+        assert!(!report.healthy);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "runtime binary" && !check.ok)
+        );
+    }
+
+    #[test]
+    fn doctor_report_is_healthy_when_requirements_exist() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join(CONFIG_FILE_NAME),
+            r#"
+                [project]
+                name = "demo"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+
+                [envs.ci]
+                build = { context = ".", file = "Containerfile", tag = "demo-ci:dev" }
+            "#,
+        )
+        .unwrap();
+        fs::write(tempdir.path().join("Containerfile"), "FROM ubuntu:latest\n").unwrap();
+        write_runtime_stub(tempdir.path(), "podman");
+        let _cwd = CurrentDirGuard::enter(tempdir.path());
+        let _path = EnvVarGuard::set("PATH", tempdir.path());
+
+        let backend = MockBackend::default();
+        let report = doctor_report(&backend, ContainerRuntime::Podman, None).unwrap();
+
+        assert!(report.healthy);
+        assert!(report.checks.iter().all(|check| check.ok));
+        assert!(
+            report
+                .environments
+                .iter()
+                .all(|environment| environment.healthy)
+        );
     }
 
     #[test]
@@ -2116,6 +2733,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Inspect(InspectCommand {
                 env: "dev".into(),
@@ -2144,6 +2762,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Create(EnvironmentName { env: "ci".into() }),
         };
@@ -2158,6 +2777,7 @@ mod tests {
             project: ProjectMetadata {
                 name: Some("Demo".into()),
                 default_env: None,
+                default_timeout: None,
             },
             envs: Default::default(),
         };
@@ -2167,6 +2787,7 @@ mod tests {
             container_name: None,
             project_mount: None,
             workdir: None,
+            timeout: None,
             env: Default::default(),
             preserve_env: vec![],
             mounts: vec![],
@@ -2189,6 +2810,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
@@ -2231,6 +2853,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Pull(RequiredPassthroughArgs {
                 args: vec!["alpine:latest".into()],
@@ -2250,6 +2873,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Ps(OptionalPassthroughArgs {
                 args: vec!["--all".into()],
@@ -2271,6 +2895,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
                     args: vec![],
@@ -2284,6 +2909,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Image(ImageCommands::Prune(OptionalPassthroughArgs {
                     args: vec![],
@@ -2297,6 +2923,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Volume(ResourceCommands::Remove(RequiredPassthroughArgs {
                     args: vec!["cache".into()],
@@ -2320,6 +2947,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Image(ImageCommands::Inspect(RequiredPassthroughArgs {
                     args: vec!["alpine:latest".into()],
@@ -2333,6 +2961,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Image(ImageCommands::Push(RequiredPassthroughArgs {
                     args: vec!["demo:latest".into()],
@@ -2346,6 +2975,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Image(ImageCommands::Tag(RequiredPassthroughArgs {
                     args: vec!["demo:latest".into(), "demo:v1".into()],
@@ -2372,6 +3002,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Image(ImageCommands::Load(OptionalPassthroughArgs {
                     args: vec!["-i".into(), "image.tar".into()],
@@ -2385,6 +3016,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Image(ImageCommands::Save(OptionalPassthroughArgs {
                     args: vec!["-o".into(), "image.tar".into(), "demo:latest".into()],
@@ -2410,6 +3042,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Container(ContainerCommands::Inspect(RequiredPassthroughArgs {
                     args: vec!["demo".into()],
@@ -2423,6 +3056,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Container(ContainerCommands::Start(RequiredPassthroughArgs {
                     args: vec!["demo".into()],
@@ -2436,6 +3070,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Container(ContainerCommands::Stop(RequiredPassthroughArgs {
                     args: vec!["demo".into()],
@@ -2449,6 +3084,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Container(ContainerCommands::Prune(OptionalPassthroughArgs {
                     args: vec![],
@@ -2493,6 +3129,7 @@ mod tests {
                 Cli {
                     debug: false,
                     yes: false,
+                    timeout: None,
                     config: None,
                     command,
                 },
@@ -2532,6 +3169,7 @@ mod tests {
                 Cli {
                     debug: false,
                     yes: false,
+                    timeout: None,
                     config: None,
                     command,
                 },
@@ -2593,6 +3231,7 @@ mod tests {
                 Cli {
                     debug: false,
                     yes: false,
+                    timeout: None,
                     config: None,
                     command,
                 },
@@ -2625,6 +3264,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::System(SystemCommands::Dns(OptionalPassthroughArgs {
                     args: vec![],
@@ -2639,6 +3279,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Registry(RegistryCommands::List(OptionalPassthroughArgs {
                     args: vec![],
@@ -2653,6 +3294,7 @@ mod tests {
             Cli {
                 debug: false,
                 yes: false,
+                timeout: None,
                 config: None,
                 command: Commands::Machine(MachineCommands::SetDefault(OptionalPassthroughArgs {
                     args: vec!["devvm".into()],
@@ -2692,6 +3334,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Enter(EnterCommand { env: None }),
         };
@@ -2722,6 +3365,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Enter(EnterCommand { env: None }),
         };
@@ -2740,6 +3384,7 @@ mod tests {
         let cli = Cli {
             debug: false,
             yes: false,
+            timeout: None,
             config: None,
             command: Commands::Enter(EnterCommand { env: None }),
         };

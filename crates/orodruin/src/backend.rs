@@ -1,6 +1,8 @@
 use std::{
-    io,
-    process::{Command, Stdio},
+    io::{self, Read},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -79,11 +81,16 @@ pub trait ContainerBackend {
 pub struct ContainerCliBackend {
     debug: bool,
     runtime: ContainerRuntime,
+    timeout: Option<Duration>,
 }
 
 impl ContainerCliBackend {
-    pub fn new(debug: bool, runtime: ContainerRuntime) -> Self {
-        Self { debug, runtime }
+    pub fn new(debug: bool, runtime: ContainerRuntime, timeout: Option<Duration>) -> Self {
+        Self {
+            debug,
+            runtime,
+            timeout,
+        }
     }
 
     pub fn build_list_spec(runtime: ContainerRuntime) -> CommandSpec {
@@ -232,12 +239,13 @@ impl ContainerCliBackend {
         if self.debug {
             eprintln!("debug: {}", spec.render());
         }
-        let output = Command::new(&spec.program)
+        let child = Command::new(&spec.program)
             .args(&spec.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|source| spawn_error(step, spec, source))?;
+        let output = wait_for_output(step, spec, child, self.timeout)?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -254,13 +262,14 @@ impl ContainerCliBackend {
         if self.debug {
             eprintln!("debug: {}", spec.render());
         }
-        let status = Command::new(&spec.program)
+        let child = Command::new(&spec.program)
             .args(&spec.args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .status()
+            .spawn()
             .map_err(|source| spawn_error(step, spec, source))?;
+        let status = wait_for_status(step, spec, child, self.timeout)?;
         if status.success() {
             return Ok(());
         }
@@ -357,6 +366,12 @@ pub enum BackendError {
         #[source]
         source: io::Error,
     },
+    #[error("timed out after {timeout:?} while attempting to {step}: {command}")]
+    TimedOut {
+        step: String,
+        command: String,
+        timeout: Duration,
+    },
     #[error("failed to {step}: {detail}")]
     CommandFailed {
         step: String,
@@ -374,8 +389,100 @@ impl BackendError {
             Self::CommandFailed {
                 status: Some(code), ..
             } => *code,
+            Self::TimedOut { .. } => 124,
             _ => 1,
         }
+    }
+}
+
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn wait_for_output(
+    step: &str,
+    spec: &CommandSpec,
+    mut child: Child,
+    timeout: Option<Duration>,
+) -> Result<Output, BackendError> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_thread = stdout.map(read_stream);
+    let stderr_thread = stderr.map(read_stream);
+    let status = wait_for_child(step, spec, &mut child, timeout)?;
+    let stdout = join_reader(stdout_thread)?;
+    let stderr = join_reader(stderr_thread)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn wait_for_status(
+    step: &str,
+    spec: &CommandSpec,
+    mut child: Child,
+    timeout: Option<Duration>,
+) -> Result<std::process::ExitStatus, BackendError> {
+    wait_for_child(step, spec, &mut child, timeout)
+}
+
+fn wait_for_child(
+    step: &str,
+    spec: &CommandSpec,
+    child: &mut Child,
+    timeout: Option<Duration>,
+) -> Result<std::process::ExitStatus, BackendError> {
+    let Some(timeout) = timeout else {
+        return child
+            .wait()
+            .map_err(|source| spawn_error(step, spec, source));
+    };
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| spawn_error(step, spec, source))?
+        {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            child
+                .kill()
+                .map_err(|source| spawn_error(step, spec, source))?;
+            let _ = child.wait();
+            return Err(BackendError::TimedOut {
+                step: step.to_string(),
+                command: spec.render(),
+                timeout,
+            });
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn read_stream<R>(mut reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn join_reader(
+    handle: Option<thread::JoinHandle<io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, BackendError> {
+    match handle {
+        Some(handle) => handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .map_err(|source| BackendError::Spawn {
+                step: "collect command output".into(),
+                source,
+            }),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -479,7 +586,7 @@ fn value_contains_apiserver(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
     use super::*;
 
@@ -514,6 +621,7 @@ mod tests {
             shell: vec!["/bin/bash".into()],
             startup_command: vec!["sleep".into(), "infinity".into()],
             default_command: None,
+            timeout: None,
             build: None,
         }
     }
@@ -610,5 +718,38 @@ mod tests {
         assert!(create_spec.args.contains(
             &"type=bind,source=/tmp/cache,target=/cache,relabel=shared,readonly".to_string()
         ));
+    }
+
+    #[test]
+    fn captured_command_times_out() {
+        let backend = ContainerCliBackend::new(
+            false,
+            ContainerRuntime::Podman,
+            Some(Duration::from_millis(50)),
+        );
+        let spec = CommandSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 1".into()],
+        };
+
+        let error = backend.run_captured("sleep", &spec).unwrap_err();
+        assert!(matches!(error, BackendError::TimedOut { .. }));
+        assert_eq!(error.exit_code(), 124);
+    }
+
+    #[test]
+    fn interactive_command_times_out() {
+        let backend = ContainerCliBackend::new(
+            false,
+            ContainerRuntime::Podman,
+            Some(Duration::from_millis(50)),
+        );
+        let spec = CommandSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 1".into()],
+        };
+
+        let error = backend.run_interactive("sleep", &spec).unwrap_err();
+        assert!(matches!(error, BackendError::TimedOut { .. }));
     }
 }

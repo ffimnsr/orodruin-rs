@@ -24,6 +24,7 @@ pub struct ResolvedEnvironment {
     pub shell: Vec<String>,
     pub startup_command: Vec<String>,
     pub default_command: Option<Vec<String>>,
+    pub timeout: Option<String>,
     pub build: Option<ResolvedBuild>,
 }
 
@@ -127,6 +128,10 @@ impl ResolvedEnvironment {
                 .clone()
                 .unwrap_or_else(|| vec!["sleep".to_string(), "infinity".to_string()]),
             default_command: config.default_command.clone(),
+            timeout: config
+                .timeout
+                .clone()
+                .or_else(|| project_config.project.default_timeout.clone()),
             build,
         }
     }
@@ -257,6 +262,7 @@ mod tests {
             project: ProjectMetadata {
                 name: Some("My App".into()),
                 default_env: None,
+                default_timeout: None,
             },
             envs: Default::default(),
         };
@@ -266,6 +272,7 @@ mod tests {
             container_name: None,
             project_mount: None,
             workdir: None,
+            timeout: None,
             env: Default::default(),
             preserve_env: vec![],
             mounts: vec![],
@@ -295,6 +302,7 @@ mod tests {
             container_name: None,
             project_mount: None,
             workdir: None,
+            timeout: None,
             env: Default::default(),
             preserve_env: vec![],
             mounts: vec![],
@@ -324,6 +332,7 @@ mod tests {
             container_name: None,
             project_mount: None,
             workdir: None,
+            timeout: None,
             env: BTreeMap::from([(String::from("LANG"), String::from("C.UTF-8"))]),
             preserve_env: vec!["SHOULD_NOT_EXIST".into()],
             mounts: vec![],

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ pub struct ProjectConfig {
 pub struct ProjectMetadata {
     pub name: Option<String>,
     pub default_env: Option<String>,
+    pub default_timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -29,6 +31,7 @@ pub struct EnvironmentConfig {
     pub container_name: Option<String>,
     pub project_mount: Option<String>,
     pub workdir: Option<String>,
+    pub timeout: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -84,15 +87,44 @@ pub enum ConfigError {
     Validation(String),
 }
 
+pub fn parse_timeout(value: &str) -> Result<Duration, String> {
+    let (number, unit) = match value
+        .char_indices()
+        .find(|(_, character)| !character.is_ascii_digit())
+    {
+        Some((index, _)) => (&value[..index], &value[index..]),
+        None => (value, "s"),
+    };
+    if number.is_empty() {
+        return Err("duration must start with a positive integer".into());
+    }
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration `{value}`"))?;
+    match unit {
+        "ms" => Ok(Duration::from_millis(amount)),
+        "s" | "" => Ok(Duration::from_secs(amount)),
+        "m" => Ok(Duration::from_secs(amount.saturating_mul(60))),
+        "h" => Ok(Duration::from_secs(amount.saturating_mul(60 * 60))),
+        _ => Err(format!(
+            "invalid duration unit in `{value}`; use ms, s, m, or h"
+        )),
+    }
+}
+
 impl ProjectConfig {
-    pub fn load_from(
+    pub fn locate_path(
         start_dir: &Path,
         explicit_path: Option<&Path>,
-    ) -> Result<LoadedConfig, ConfigError> {
-        let path = match explicit_path {
-            Some(path) => path.to_path_buf(),
-            None => find_config_path(start_dir)?,
-        };
+    ) -> Result<PathBuf, ConfigError> {
+        match explicit_path {
+            Some(path) => Ok(path.to_path_buf()),
+            None => find_config_path(start_dir),
+        }
+    }
+
+    pub fn load_path(path: &Path) -> Result<LoadedConfig, ConfigError> {
+        let path = path.to_path_buf();
         let root = fs::canonicalize(path.parent().ok_or_else(|| {
             ConfigError::Validation("config path has no parent directory".into())
         })?)
@@ -114,6 +146,14 @@ impl ProjectConfig {
         Ok(LoadedConfig { root, path, config })
     }
 
+    pub fn load_from(
+        start_dir: &Path,
+        explicit_path: Option<&Path>,
+    ) -> Result<LoadedConfig, ConfigError> {
+        let path = Self::locate_path(start_dir, explicit_path)?;
+        Self::load_path(&path)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.envs.is_empty() {
             return Err(ConfigError::Validation(
@@ -133,6 +173,9 @@ impl ProjectConfig {
                 )));
             }
         }
+        if let Some(default_timeout) = self.project.default_timeout.as_deref() {
+            validate_timeout("project.default_timeout", default_timeout)?;
+        }
 
         for (name, env) in &self.envs {
             let has_image = env.image.is_some();
@@ -145,6 +188,9 @@ impl ProjectConfig {
 
             if let Some(project_mount) = &env.project_mount {
                 validate_absolute_path(name, "project_mount", project_mount)?;
+            }
+            if let Some(timeout) = env.timeout.as_deref() {
+                validate_timeout(&format!("environment `{name}` timeout"), timeout)?;
             }
             if let Some(workdir) = &env.workdir {
                 validate_absolute_path(name, "workdir", workdir)?;
@@ -211,6 +257,7 @@ pub fn default_init_config(project_name: &str) -> Result<String, ConfigError> {
             container_name: None,
             project_mount: Some(format!("/workspace/{project_name}")),
             workdir: Some(format!("/workspace/{project_name}")),
+            timeout: None,
             env: BTreeMap::new(),
             preserve_env: vec!["SSH_AUTH_SOCK".into()],
             mounts: vec![],
@@ -224,10 +271,22 @@ pub fn default_init_config(project_name: &str) -> Result<String, ConfigError> {
         project: ProjectMetadata {
             name: Some(project_name.to_string()),
             default_env: None,
+            default_timeout: None,
         },
         envs,
     })
     .map_err(ConfigError::from)
+}
+
+fn validate_timeout(field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not be empty"
+        )));
+    }
+    parse_timeout(value)
+        .map(|_| ())
+        .map_err(ConfigError::Validation)
 }
 
 fn validate_absolute_path(env_name: &str, field: &str, path: &str) -> Result<(), ConfigError> {
@@ -322,6 +381,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_default_timeout() {
+        let config: ProjectConfig = toml::from_str(
+            r#"
+                [project]
+                default_timeout = "4d"
+
+                [envs.dev]
+                image = "ubuntu:latest"
+            "#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("invalid duration unit"));
+    }
+
+    #[test]
     fn rejects_unknown_default_env() {
         let config: ProjectConfig = toml::from_str(
             r#"
@@ -354,6 +430,7 @@ mod tests {
             Some("/workspace/demo \"quoted\"")
         );
         assert_eq!(env.workdir.as_deref(), Some("/workspace/demo \"quoted\""));
+        assert_eq!(env.timeout, None);
         assert_eq!(
             env.shell.as_deref(),
             Some([String::from("/bin/bash")].as_slice())
