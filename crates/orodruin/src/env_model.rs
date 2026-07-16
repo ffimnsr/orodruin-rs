@@ -79,7 +79,24 @@ impl ResolvedEnvironment {
             )
         });
 
-        let mut env_map = config.env.clone();
+        let mut env_map = BTreeMap::new();
+
+        // 1. Load env_files (lowest priority)
+        for env_file_path in &config.env_files {
+            let path = resolve_relative_path(project_root, env_file_path);
+            if let Ok(file_env) = parse_env_file(&path) {
+                for (key, value) in file_env {
+                    env_map.entry(key).or_insert(value);
+                }
+            }
+        }
+
+        // 2. Config env overrides env_files
+        for (key, value) in &config.env {
+            env_map.insert(key.clone(), value.clone());
+        }
+
+        // 3. Preserve env fills gaps (does not override config.env)
         for key in &config.preserve_env {
             if let Ok(value) = env::var(key) {
                 env_map.entry(key.clone()).or_insert(value);
@@ -219,6 +236,44 @@ fn resolve_current_user() -> ResolvedUser {
     }
 }
 
+pub(crate) fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    let mut map = BTreeMap::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Strip optional "export " prefix
+        let entry = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+
+        // Find the first '=' to split key and value
+        if let Some(eq_pos) = entry.find('=') {
+            let key = entry[..eq_pos].trim().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            let mut value = entry[eq_pos + 1..].trim().to_string();
+
+            // Strip surrounding quotes if matching
+            let value_len = value.len();
+            if value_len >= 2 {
+                let first = value.chars().next().unwrap();
+                let last = value.chars().last().unwrap();
+                if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+                    value = value[1..value_len - 1].to_string();
+                }
+            }
+
+            map.insert(key, value);
+        }
+    }
+
+    Ok(map)
+}
+
 fn current_username(uid: u32) -> Option<String> {
     let mut buffer = vec![0; 4096];
     let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
@@ -276,6 +331,7 @@ mod tests {
             env: Default::default(),
             preserve_env: vec![],
             mounts: vec![],
+            env_files: vec![],
             shell: None,
             startup_command: None,
             default_command: None,
@@ -306,6 +362,7 @@ mod tests {
             env: Default::default(),
             preserve_env: vec![],
             mounts: vec![],
+            env_files: vec![],
             shell: None,
             startup_command: None,
             default_command: None,
@@ -318,6 +375,88 @@ mod tests {
         assert_eq!(resolved.mounts[0].source, Path::new("/tmp/app"));
         assert_eq!(resolved.user.uid, unsafe { libc::getuid() });
         assert_eq!(resolved.user.gid, unsafe { libc::getgid() });
+    }
+
+    #[test]
+    fn parse_env_file_reads_key_value_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            r#"# comment
+                FOO=bar
+                export BAZ=qux
+                EMPTY=
+                QUOTED="hello world"
+                SINGLE='single quoted'
+            "#,
+        )
+        .unwrap();
+
+        let env = parse_env_file(&path).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("BAZ").map(String::as_str), Some("qux"));
+        assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(env.get("QUOTED").map(String::as_str), Some("hello world"));
+        assert_eq!(env.get("SINGLE").map(String::as_str), Some("single quoted"));
+        assert_eq!(env.len(), 5);
+    }
+
+    #[test]
+    fn parse_env_file_skips_empty_and_commented_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "\n\n  \n# just a comment\n#another one\n").unwrap();
+
+        let env = parse_env_file(&path).unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn parse_env_file_handles_missing_file_gracefully() {
+        let path = Path::new("/tmp/nonexistent-file-for-test-12345.env");
+        let result = parse_env_file(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn env_file_values_are_overridden_by_explicit_config_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        std::fs::write(&env_file, "MY_VAR=from_file\nOTHER=also_from_file\n").unwrap();
+
+        let project = ProjectConfig {
+            project: ProjectMetadata::default(),
+            envs: Default::default(),
+        };
+        let env = EnvironmentConfig {
+            image: Some("ubuntu:latest".into()),
+            build: None,
+            container_name: None,
+            project_mount: None,
+            workdir: None,
+            timeout: None,
+            env: BTreeMap::from([(String::from("MY_VAR"), String::from("from_config"))]),
+            preserve_env: vec![],
+            mounts: vec![],
+            env_files: vec![env_file.display().to_string()],
+            shell: None,
+            startup_command: None,
+            default_command: None,
+        };
+
+        let resolved = ResolvedEnvironment::resolve(dir.path(), &project, "dev", &env);
+
+        // Config env overrides env_file
+        assert_eq!(
+            resolved.env.get("MY_VAR").map(String::as_str),
+            Some("from_config")
+        );
+        // Env_file values that aren't in config.env are preserved
+        assert_eq!(
+            resolved.env.get("OTHER").map(String::as_str),
+            Some("also_from_file")
+        );
     }
 
     #[test]
@@ -336,6 +475,7 @@ mod tests {
             env: BTreeMap::from([(String::from("LANG"), String::from("C.UTF-8"))]),
             preserve_env: vec!["SHOULD_NOT_EXIST".into()],
             mounts: vec![],
+            env_files: vec![],
             shell: None,
             startup_command: None,
             default_command: Some(vec!["cargo".into(), "test".into()]),

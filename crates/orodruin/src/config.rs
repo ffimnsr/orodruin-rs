@@ -38,6 +38,8 @@ pub struct EnvironmentConfig {
     pub preserve_env: Vec<String>,
     #[serde(default)]
     pub mounts: Vec<MountConfig>,
+    #[serde(default)]
+    pub env_files: Vec<String>,
     pub shell: Option<Vec<String>>,
     pub startup_command: Option<Vec<String>>,
     pub default_command: Option<Vec<String>>,
@@ -212,6 +214,14 @@ impl ProjectConfig {
                 }
                 preserve_env.insert(key);
             }
+
+            for env_file in &env.env_files {
+                if env_file.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "environment `{name}` contains an empty env_files entry"
+                    )));
+                }
+            }
             for mount in &env.mounts {
                 if mount.source.trim().is_empty() || mount.target.trim().is_empty() {
                     return Err(ConfigError::Validation(format!(
@@ -261,6 +271,7 @@ pub fn default_init_config(project_name: &str) -> Result<String, ConfigError> {
             env: BTreeMap::new(),
             preserve_env: vec!["SSH_AUTH_SOCK".into()],
             mounts: vec![],
+            env_files: vec![],
             shell: Some(vec!["/bin/bash".into()]),
             startup_command: Some(vec!["sleep".into(), "infinity".into()]),
             default_command: None,
@@ -416,6 +427,21 @@ mod tests {
                 .to_string()
                 .contains("project.default_env `ci` is not defined")
         );
+    }
+
+    #[test]
+    fn rejects_empty_env_files_entry() {
+        let config: ProjectConfig = toml::from_str(
+            r#"
+                [envs.dev]
+                image = "ubuntu:latest"
+                env_files = [""]
+            "#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("empty env_files entry"));
     }
 
     #[test]

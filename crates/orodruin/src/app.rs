@@ -125,11 +125,12 @@ fn run_with_backend_for_runtime(
                 resolve_optional_environment(&loaded, environment.env.as_deref(), "enter")?;
             materialize_environment_for_runtime_with_prompt(backend, runtime, &resolved, prompt)?;
             ensure_container_user(backend, &resolved)?;
+            let extra_env = parse_extra_env(&environment.env_vars)?;
             match backend.exec(
                 &resolved.container_name,
                 &ExecRequest {
                     workdir: Some(resolved.workdir.clone()),
-                    env: exec_environment(&resolved),
+                    env: exec_environment(&resolved, &extra_env),
                     command: resolved.shell.clone(),
                     interactive: true,
                     user: Some(resolved.user.clone()),
@@ -145,13 +146,14 @@ fn run_with_backend_for_runtime(
             let loaded = load_config(cli.config.as_deref())?;
             let resolved = resolve_optional_environment(&loaded, run.env.as_deref(), "run")?;
             materialize_environment_for_runtime_with_prompt(backend, runtime, &resolved, prompt)?;
+            let extra_env = parse_extra_env(&run.env_vars)?;
             let command = resolve_run_command(&resolved, run)?;
             ensure_container_user(backend, &resolved)?;
             backend.exec(
                 &resolved.container_name,
                 &ExecRequest {
                     workdir: Some(resolved.workdir.clone()),
-                    env: exec_environment(&resolved),
+                    env: exec_environment(&resolved, &extra_env),
                     command,
                     interactive: false,
                     user: Some(resolved.user.clone()),
@@ -1136,10 +1138,10 @@ fn print_doctor_report(report: &DoctorReport) {
     );
     println!("runtime: {} ({})", report.runtime, report.runtime_program);
     if let Some(config_path) = &report.config_path {
-        println!("config: {}", config_path);
+        println!("config: {config_path}");
     }
     if let Some(project_root) = &report.project_root {
-        println!("project root: {}", project_root);
+        println!("project root: {project_root}");
     }
 
     for check in &report.checks {
@@ -1649,7 +1651,26 @@ fn ensure_container_user(
     Ok(())
 }
 
-fn exec_environment(resolved: &ResolvedEnvironment) -> Vec<(String, String)> {
+fn parse_extra_env(vars: &[String]) -> Result<Vec<(String, String)>, OrodruinError> {
+    let mut result = Vec::with_capacity(vars.len());
+    for var in vars {
+        let (key, value) = var.split_once('=').ok_or_else(|| {
+            OrodruinError::Message(format!("invalid --env value `{var}`; expected KEY=VALUE"))
+        })?;
+        if key.is_empty() {
+            return Err(OrodruinError::Message(
+                "--env: variable name must not be empty".into(),
+            ));
+        }
+        result.push((key.to_string(), value.to_string()));
+    }
+    Ok(result)
+}
+
+fn exec_environment(
+    resolved: &ResolvedEnvironment,
+    extra_env: &[(String, String)],
+) -> Vec<(String, String)> {
     let mut env = resolved
         .env
         .iter()
@@ -1658,6 +1679,16 @@ fn exec_environment(resolved: &ResolvedEnvironment) -> Vec<(String, String)> {
     env.push(("HOME".into(), resolved.user.home.clone()));
     env.push(("USER".into(), resolved.user.username.clone()));
     env.push(("LOGNAME".into(), resolved.user.username.clone()));
+
+    // Apply CLI --env overrides (highest priority, overrides resolved and HOME/USER/LOGNAME)
+    for (key, value) in extra_env {
+        if let Some(pos) = env.iter().position(|(k, _)| k == key) {
+            env[pos] = (key.clone(), value.clone());
+        } else {
+            env.push((key.clone(), value.clone()));
+        }
+    }
+
     env
 }
 
@@ -2075,6 +2106,7 @@ mod tests {
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
+                env_vars: vec![],
             }),
         };
 
@@ -2380,6 +2412,7 @@ mod tests {
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
+                env_vars: vec![],
             }),
         };
 
@@ -2431,6 +2464,7 @@ mod tests {
             config: None,
             command: Commands::Run(RunCommand {
                 env: Some("ci".into()),
+                env_vars: vec![],
                 command: vec![],
             }),
         };
@@ -2475,6 +2509,7 @@ mod tests {
             config: None,
             command: Commands::Run(RunCommand {
                 env: None,
+                env_vars: vec![],
                 command: vec![],
             }),
         };
@@ -2538,7 +2573,10 @@ mod tests {
             yes: false,
             timeout: Some(Duration::from_secs(2)),
             config: None,
-            command: Commands::Enter(EnterCommand { env: None }),
+            command: Commands::Enter(EnterCommand {
+                env: None,
+                env_vars: vec![],
+            }),
         };
         assert_eq!(
             configured_timeout_for_cli(&override_cli).unwrap(),
@@ -2791,6 +2829,7 @@ mod tests {
             env: Default::default(),
             preserve_env: vec![],
             mounts: vec![],
+            env_files: vec![],
             shell: None,
             startup_command: None,
             default_command: None,
@@ -2814,11 +2853,13 @@ mod tests {
             config: None,
             command: Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
+                env_vars: vec![],
             }),
         };
 
         run_with_backend(cli, &backend).unwrap();
 
+        assert_eq!(backend.execs.borrow().len(), 2);
         let execs = backend.execs.borrow();
         assert_eq!(execs[0].command[0], "/bin/sh");
         assert!(execs[0].command[2].contains("useradd -K UID_MIN=0 -K UID_MAX=60000"));
@@ -3336,7 +3377,10 @@ mod tests {
             yes: false,
             timeout: None,
             config: None,
-            command: Commands::Enter(EnterCommand { env: None }),
+            command: Commands::Enter(EnterCommand {
+                env: None,
+                env_vars: vec![],
+            }),
         };
 
         run_with_backend(cli, &backend).unwrap();
@@ -3367,7 +3411,10 @@ mod tests {
             yes: false,
             timeout: None,
             config: None,
-            command: Commands::Enter(EnterCommand { env: None }),
+            command: Commands::Enter(EnterCommand {
+                env: None,
+                env_vars: vec![],
+            }),
         };
 
         run_with_backend(cli, &backend).unwrap();
@@ -3386,7 +3433,10 @@ mod tests {
             yes: false,
             timeout: None,
             config: None,
-            command: Commands::Enter(EnterCommand { env: None }),
+            command: Commands::Enter(EnterCommand {
+                env: None,
+                env_vars: vec![],
+            }),
         };
 
         let error = run_with_backend(cli, &backend).unwrap_err();
@@ -3422,5 +3472,32 @@ mod tests {
         assert!(output.contains("version"));
         assert!(!output.contains("set-default"));
         assert!(!output.contains(" dns "));
+    }
+
+    #[test]
+    fn parse_extra_env_parses_key_value_pairs() {
+        let result = parse_extra_env(&["FOO=bar".into(), "X=1".into()]).unwrap();
+        assert_eq!(
+            result,
+            vec![("FOO".into(), "bar".into()), ("X".into(), "1".into())]
+        );
+    }
+
+    #[test]
+    fn parse_extra_env_rejects_missing_equals() {
+        let error = parse_extra_env(&["INVALID".into()]).unwrap_err();
+        assert!(error.to_string().contains("expected KEY=VALUE"));
+    }
+
+    #[test]
+    fn parse_extra_env_rejects_empty_key() {
+        let error = parse_extra_env(&["=value".into()]).unwrap_err();
+        assert!(error.to_string().contains("name must not be empty"));
+    }
+
+    #[test]
+    fn parse_extra_env_allows_empty_value() {
+        let result = parse_extra_env(&["EMPTY=".into()]).unwrap();
+        assert_eq!(result, vec![("EMPTY".into(), "".into())]);
     }
 }

@@ -280,6 +280,13 @@ pub struct EnterCommand {
         help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment"
     )]
     pub env: Option<String>,
+    #[arg(
+        long = "env",
+        short = 'e',
+        value_name = "KEY=VALUE",
+        help = "Set an environment variable in the container (can be used multiple times)"
+    )]
+    pub env_vars: Vec<String>,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -288,6 +295,13 @@ pub struct RunCommand {
         help = "Environment name from orodruin.toml; defaults from project.default_env or the sole environment"
     )]
     pub env: Option<String>,
+    #[arg(
+        long = "env",
+        short = 'e',
+        value_name = "KEY=VALUE",
+        help = "Set an environment variable in the container (can be used multiple times)"
+    )]
+    pub env_vars: Vec<String>,
     #[arg(
         last = true,
         help = "Command to execute after `--`; uses the environment default if omitted"
@@ -621,6 +635,7 @@ mod tests {
             cli.command,
             Commands::Run(RunCommand {
                 env: None,
+                env_vars: vec![],
                 command: vec![],
             })
         );
@@ -630,6 +645,7 @@ mod tests {
             cli.command,
             Commands::Run(RunCommand {
                 env: Some("dev".into()),
+                env_vars: vec![],
                 command: vec![],
             })
         );
@@ -639,6 +655,7 @@ mod tests {
             cli.command,
             Commands::Run(RunCommand {
                 env: Some("dev".into()),
+                env_vars: vec![],
                 command: vec!["date".into()],
             })
         );
@@ -647,13 +664,54 @@ mod tests {
     #[test]
     fn parses_enter_without_environment() {
         let cli = Cli::parse_from(["orodruin", "enter"]);
-        assert_eq!(cli.command, Commands::Enter(EnterCommand { env: None }));
+        assert_eq!(
+            cli.command,
+            Commands::Enter(EnterCommand {
+                env: None,
+                env_vars: vec![],
+            })
+        );
 
         let cli = Cli::parse_from(["orodruin", "enter", "dev"]);
         assert_eq!(
             cli.command,
             Commands::Enter(EnterCommand {
                 env: Some("dev".into()),
+                env_vars: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_env_flag_on_enter_and_run() {
+        let cli = Cli::parse_from(["orodruin", "enter", "-e", "FOO=bar"]);
+        assert_eq!(
+            cli.command,
+            Commands::Enter(EnterCommand {
+                env: None,
+                env_vars: vec!["FOO=bar".into()],
+            })
+        );
+
+        let cli = Cli::parse_from([
+            "orodruin", "run", "dev", "--env", "X=1", "--env", "Y=2", "--", "echo", "hello",
+        ]);
+        assert_eq!(
+            cli.command,
+            Commands::Run(RunCommand {
+                env: Some("dev".into()),
+                env_vars: vec!["X=1".into(), "Y=2".into()],
+                command: vec!["echo".into(), "hello".into()],
+            })
+        );
+
+        let cli = Cli::parse_from(["orodruin", "run", "--env", "EMPTY="]);
+        assert_eq!(
+            cli.command,
+            Commands::Run(RunCommand {
+                env: None,
+                env_vars: vec!["EMPTY=".into()],
+                command: vec![],
             })
         );
     }

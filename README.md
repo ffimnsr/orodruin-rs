@@ -80,6 +80,7 @@ workdir = "/workspace/demo"
 shell = ["/bin/bash"]
 startup_command = ["sleep", "infinity"]
 preserve_env = ["SSH_AUTH_SOCK"]
+env_files = [".env", ".env.local"]
 
 [envs.api]
 build = { context = ".", file = "Dockerfile", tag = "demo-api:latest" }
@@ -115,6 +116,8 @@ orodruin run dev -- bash -lc 'pwd && id'
 - Use `project.default_timeout` to set default subprocess timeout for config-driven commands.
 - Use `envs.<name>.timeout` to override timeout for specific environment commands.
 - CLI `--timeout` overrides both config timeout settings.
+- Use `envs.<name>.env_files` to load environment from `.env` files (relative to the project root).
+- Use `orodruin enter --env KEY=VALUE` and `orodruin run --env KEY=VALUE` to set env vars per invocation.
 
 ## Runtime Selection
 
@@ -158,6 +161,8 @@ Notes:
 
 - `enter` defaults to `project.default_env` or the only configured environment when possible.
 - `run` expects the command after `--`.
+- `enter` and `run` accept `--env` / `-e KEY=VALUE` (repeatable) to set or override environment variables.
+- Environment variable priority (lowest to highest): `env_files` → config `env` → `preserve_env` → CLI `--env`.
 
 ### Runtime Passthrough Commands
 
