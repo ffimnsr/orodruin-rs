@@ -1,4 +1,5 @@
 /target/
+/.atlas/
 orodruin.toml
 *.md
 !README.md
